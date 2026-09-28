@@ -1,0 +1,68 @@
+# ---------- Secrets / Environment ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+credentials.json
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ---------- Virtual environments ----------
+venv/
+.venv/
+env/
+ENV/
+
+# ---------- Packaging / build ----------
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ---------- Testing / cache ----------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ---------- Logs / temp ----------
+*.log
+logs/
+tmp/
+temp/
+
+# ---------- Data files (bade output / scraped data) ----------
+*.csv
+*.xlsx
+*.zip
+*.db
+*.sqlite3
+output/
+data/
+downloads/
+
+# ---------- Browser profiles (Playwright / DrissionPage) ----------
+*_profile/
+brave_dp_profile*/
+chrome_profile*/
+
+# ---------- IDE / OS ----------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- Jupyter ----------
+.ipynb_checkpoints/
