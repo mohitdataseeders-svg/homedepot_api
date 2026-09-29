@@ -143,12 +143,11 @@ def parse_pdp(html: str, url: str) -> dict:
     seen = set()
     unique_urls = []
 
-    for url in images:
-        url = re.sub(r'_\d+\.jpg$', '_1000.jpg', url)
-
-        if url not in seen:
-            seen.add(url)
-            unique_urls.append(url)
+    for img in images:
+        img = re.sub(r'_\d+\.jpg$', '_1000.jpg', img)
+        if img not in seen:
+            seen.add(img)
+            unique_urls.append(img)
 
     result = " | ".join(unique_urls)
 
