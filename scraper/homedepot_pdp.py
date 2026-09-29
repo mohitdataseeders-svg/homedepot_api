@@ -344,7 +344,7 @@ def parse_pdp(html: str, url: str) -> dict:
 
     if not data["Product Name"] and not data["Sale Price"]:
         raise ValueError("Parsing failed: page has no product data (blocked or layout changed)")
-    return c_replace(data)
+    return data
 
 
 async def scrape_pdp(
