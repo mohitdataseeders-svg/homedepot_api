@@ -23,7 +23,7 @@ from urllib.parse import quote
 
 import httpx
 from parsel import Selector
-
+from clear_text import c_replace
 from config import settings
 
 SCRAPEDO = "https://api.scrape.do/"
@@ -134,18 +134,37 @@ def parse_pdp(html: str, url: str) -> dict:
     if isinstance(brand, dict):
         brand = brand.get("name")
 
+    # images = p.get("image") or []
+    # if isinstance(images, str):
+    #     images = [images]
+
     images = p.get("image") or []
-    if isinstance(images, str):
-        images = [images]
+
+    seen = set()
+    unique_urls = []
+
+    for url in images:
+        url = re.sub(r'_\d+\.jpg$', '_1000.jpg', url)
+
+        if url not in seen:
+            seen.add(url)
+            unique_urls.append(url)
+
+    result = " | ".join(unique_urls)
 
     m = re.search(r"/(\d{6,})(?:[/?#]|$)", url)
     item_id = m.group(1) if m else None
     product_id = p.get("productID", "") or item_id or ""
 
-    title = p.get("name")
-    if not title:
-        m_h1 = H1_RE.search(html)
-        title = TAG_RE.sub("", m_h1.group(1)).strip() if m_h1 else None
+    # title = p.get("name")
+    # if not title:
+    #     m_h1 = H1_RE.search(html)
+    #     title = TAG_RE.sub("", m_h1.group(1)).strip() if m_h1 else None
+
+    product_name = p.get("name", "")
+
+    if brand and product_name.lower().startswith(brand.lower()):
+        product_name = product_name[len(brand):].lstrip(" -:,|").strip()
 
     breadcrumb, category = _breadcrumb(sel)
 
@@ -216,24 +235,32 @@ def parse_pdp(html: str, url: str) -> dict:
     iso_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     price_str = offers.get("price", "")
-    price = float(price_str) if price_str else 0.0
+    mrp = offers.get("priceSpecification", {}).get("price", "")
+
+    if price_str:
+        price = float(price_str)
+    else:
+        price = float(mrp) if mrp else 0.0
+
+    if not mrp:
+        mrp = price
 
     data = {
         "_id": hashid_prod,
         "item_id": item_id,
         "Product URL": canonical_link or url,
-        "Product Name": title,
+        "Product Name": product_name,
         "Product ID": product_id,
         "Brand": brand,
         "SKU": p.get("sku"),
         "Model": p.get("model"),
         "Datetime": iso_date,
-        "Image URL": " | ".join(images),
+        "Image URL": result,
         "Description": p.get("description"),
         "Category": category,
         "Breadcrumb": breadcrumb,
         "Sale Price": price,
-        "Full Price": price,
+        "Full Price": mrp,
         "Currency": offers.get("priceCurrency") or offers.get("currencyIso", "$"),
         "Rating": rating.get("ratingValue"),
         "ReviewCount": rating.get("reviewCount"),
@@ -276,7 +303,7 @@ def parse_pdp(html: str, url: str) -> dict:
 
     if not data["Product Name"] and not data["Sale Price"]:
         raise ValueError("Parsing failed: page has no product data (blocked or layout changed)")
-    return data
+    return c_replace(data)
 
 
 async def scrape_pdp(
@@ -295,7 +322,7 @@ async def scrape_pdp(
                 if r.status_code == 200:
                     # parsing alag thread me, taaki event loop block na ho
                     data = await asyncio.to_thread(parse_pdp, r.text, url)
-                    return {"url": url, "status": "success", "data": data}
+                    return {"url": url, "status": "success 200", "data": data}
                 last_err = f"HTTP {r.status_code}: {r.text[:200]}"
                 if r.status_code in (400, 401, 404):
                     break  # retry se koi fayda nahi
