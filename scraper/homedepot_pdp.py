@@ -30,7 +30,7 @@ SCRAPEDO = "https://api.scrape.do/"
 
 
 def c_replace(html=""):
-    """Clean HTML content"""
+    """Clean HTML content (recursive: str / list / dict, other types pass through)"""
     if isinstance(html, str):
         html = html.replace("&gt;", ">")
         html = html.replace("&lt;", "<")
@@ -48,7 +48,7 @@ def c_replace(html=""):
         html = html.replace("<li>", " ")
         html = html.replace("</li>", " ")
         html = html.replace("™", "")
-        html = html.replace("​", "")
+        html = html.replace("\u200b", "")
 
         html = re.sub(
             r"\* style specs start[^>]*>([\w\W]*?)style specs end \*", " ", html
@@ -59,16 +59,19 @@ def c_replace(html=""):
         html = re.sub(r"<([\w\W]*?)>", " ", html)
         html = re.sub(r"<.*?>", " ", html)
         html = re.sub(r" +", " ", html)
-
         return html.strip()
 
     elif isinstance(html, list):
-        return [j for j in [c_replace(i) for i in html] if j]
+        # keep non-empty items; don't drop 0 / False / None-safe values wrongly
+        cleaned = [c_replace(i) for i in html]
+        return [j for j in cleaned if j not in ("", None, [], {})]
+
+    elif isinstance(html, dict):
+        return {k: c_replace(v) for k, v in html.items()}
 
     else:
-        raise TypeError(
-            f"must be str or list - object pass is ({type(html)}) object...."
-        )
+        # int, float, bool, None -> leave untouched
+        return html
 
 
 def build_scrapedo_url(url: str, store_id: str | None, zip_code: str | None) -> str:
