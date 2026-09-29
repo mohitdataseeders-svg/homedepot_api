@@ -179,11 +179,9 @@ def parse_pdp(html: str, url: str) -> dict:
     if isinstance(brand, dict):
         brand = brand.get("name")
 
-    # images = p.get("image") or []
-    # if isinstance(images, str):
-    #     images = [images]
-
     images = p.get("image") or []
+    if isinstance(images, str):
+        images = [images]
 
     seen = set()
     unique_urls = []
@@ -194,7 +192,7 @@ def parse_pdp(html: str, url: str) -> dict:
             seen.add(img)
             unique_urls.append(img)
 
-    result = " | ".join(unique_urls)
+    result = "\n".join(unique_urls)
 
     m = re.search(r"/(\d{6,})(?:[/?#]|$)", url)
     item_id = m.group(1) if m else None
