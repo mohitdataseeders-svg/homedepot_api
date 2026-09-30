@@ -395,7 +395,8 @@ async def scrape_pdp(
                 r = await client.get(build_scrapedo_url(url, store_id, zip_code))
                 if r.status_code == 200:
                     # raw HTML as-is, no parsing
-                    return {"url": url, "status": "success 200", "html": r.text}
+                    # return {"url": url, "status": "success 200", "html": r.text}
+                    return {"url": url, "status": "success 200", "data": r.text}
                 last_err = f"HTTP {r.status_code}: {r.text[:200]}"
                 if r.status_code in (400, 401, 404):
                     break  # retry se koi fayda nahi
