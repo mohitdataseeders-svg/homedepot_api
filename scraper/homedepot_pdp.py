@@ -345,9 +345,40 @@ def parse_pdp(html: str, url: str) -> dict:
 
     if not data["Product Name"] and not data["Sale Price"]:
         raise ValueError("Parsing failed: page has no product data (blocked or layout changed)")
-    # return data
-    return html
+    return data
+    # return html
 
+# TODO : For Json
+
+# async def scrape_pdp(
+#     url: str,
+#     store_id: str | None = None,
+#     zip_code: str | None = None,
+#     client: httpx.AsyncClient | None = None,
+# ) -> dict:
+#     own_client = client is None
+#     client = client or httpx.AsyncClient(timeout=settings.request_timeout)
+#     last_err = "unknown error"
+#     try:
+#         for attempt in range(1, settings.retries + 1):
+#             try:
+#                 r = await client.get(build_scrapedo_url(url, store_id, zip_code))
+#                 if r.status_code == 200:
+#                     # parsing alag thread me, taaki event loop block na ho
+#                     data = await asyncio.to_thread(parse_pdp, r.text, url)
+#                     return {"url": url, "status": "success 200", "data": data}
+#                 last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+#                 if r.status_code in (400, 401, 404):
+#                     break  # retry se koi fayda nahi
+#             except Exception as e:  # noqa: BLE001
+#                 last_err = f"{type(e).__name__}: {e}"
+#             await asyncio.sleep(0.5 * attempt)
+#         return {"url": url, "status": "failed", "error": last_err}
+#     finally:
+#         if own_client:
+#             await client.aclose()
+
+# TODO : For HTML
 
 async def scrape_pdp(
     url: str,
@@ -363,9 +394,8 @@ async def scrape_pdp(
             try:
                 r = await client.get(build_scrapedo_url(url, store_id, zip_code))
                 if r.status_code == 200:
-                    # parsing alag thread me, taaki event loop block na ho
-                    data = await asyncio.to_thread(parse_pdp, r.text, url)
-                    return {"url": url, "status": "success 200", "data": data}
+                    # raw HTML as-is, no parsing
+                    return {"url": url, "status": "success 200", "html": r.text}
                 last_err = f"HTTP {r.status_code}: {r.text[:200]}"
                 if r.status_code in (400, 401, 404):
                     break  # retry se koi fayda nahi
