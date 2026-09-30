@@ -74,13 +74,38 @@ def c_replace(html=""):
         return html
 
 
+# def build_scrapedo_url(url: str, store_id: str | None, zip_code: str | None) -> str:
+#     params = f"token={settings.scrapedo_token}&url={quote(url, safe='')}&geoCode=us"
+#     cookies = []
+#     if store_id:
+#         cookies.append(f"THD_PERSIST=C4%3D{store_id}%2B%2B%3BC4_EXP%3D9999999999")
+#     if zip_code:
+#         cookies.append(f"THD_LOCALIZER=%7B%22WORKFLOW%22%3A%22LOCALIZED_BY_ZIP%22%7D")
+#     if cookies:
+#         params += "&setCookies=" + quote(";".join(cookies), safe="")
+#     return f"{SCRAPEDO}?{params}"
+
 def build_scrapedo_url(url: str, store_id: str | None, zip_code: str | None) -> str:
     params = f"token={settings.scrapedo_token}&url={quote(url, safe='')}&geoCode=us"
     cookies = []
+
     if store_id:
-        cookies.append(f"THD_PERSIST=C4%3D{store_id}%2B%2B%3BC4_EXP%3D9999999999")
+        loc = {
+            "THD_LOCSTORE": f"{store_id}+",
+            "WORKFLOW": "LOCALIZED_BY_STORE",
+            "THD_FORCE_LOC": "0",
+            "THD_INTERNAL": "0",
+        }
+        if zip_code:
+            loc["THD_STRFINDERZIP"] = zip_code
+        cookies.append("THD_LOCALIZER=" + quote(json.dumps(loc, separators=(",", ":")), safe=""))
+    elif zip_code:
+        loc = {"WORKFLOW": "LOCALIZED_BY_ZIP", "THD_STRFINDERZIP": zip_code}
+        cookies.append("THD_LOCALIZER=" + quote(json.dumps(loc, separators=(",", ":")), safe=""))
+
     if zip_code:
-        cookies.append(f"THD_LOCALIZER=%7B%22WORKFLOW%22%3A%22LOCALIZED_BY_ZIP%22%7D")
+        cookies += [f"DELIVERY_ZIP={zip_code}", "DELIVERY_ZIP_TYPE=USER"]
+
     if cookies:
         params += "&setCookies=" + quote(";".join(cookies), safe="")
     return f"{SCRAPEDO}?{params}"
