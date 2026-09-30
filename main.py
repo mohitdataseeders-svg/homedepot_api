@@ -12,6 +12,7 @@ from fastapi.security import APIKeyHeader
 from config import settings
 from schemas import PDPRequest, PDPResponse, PDPResult
 from scraper.homedepot_pdp import scrape_pdp
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 
 state: dict = {}
 
@@ -80,6 +81,12 @@ async def process(url: str, req: PDPRequest) -> PDPResult:
         await save_cache(url, req.store_id, res["data"])
     return PDPResult(**res)
 
+async def fetch_html(url: str, store_id: str | None, zip_code: str | None):
+    """Raw HTML directly from scrape_pdp (no PDPResult schema, no cache)."""
+    async with state["sem"]:
+        res = await scrape_pdp(url, store_id, zip_code, state["client"])
+    return res
+
 
 @app.get("/health")
 async def health():
@@ -109,21 +116,19 @@ async def homedepot_pdp_get(
     zip_code: str | None = Query(None, description="Optional zip code"),
     use_cache: bool = Query(True, description="Use Mongo cache if available"),
 ):
-    url = unquote(url)
+    # ---- OLD JSON VERSION ----
+    # url = unquote(url)
+    # req = PDPRequest(urls=[url],store_id=store_id,zip_code=zip_code,use_cache=use_cache)
+    # result = await process(url, req)
+    # if result.status != "success":
+    #     return JSONResponse(status_code=502, content=result.model_dump())
+    # return result.model_dump()
 
-    req = PDPRequest(
-        urls=[url],
-        store_id=store_id,
-        zip_code=zip_code,
-        use_cache=use_cache,
-    )
-
-    result = await process(url, req)
-
-    if result.status != "success":
-        return JSONResponse(status_code=502, content=result.model_dump())
-
-    return result.model_dump()
+    # ---- NEW HTML VERSION ----
+    res = await fetch_html(url, store_id, zip_code)
+    if not res["status"].startswith("success"):
+        return PlainTextResponse(res.get("error") or "failed", status_code=502)
+    return HTMLResponse(content=res["data"])
 
 
 # ---------- GET by PRODUCT ID (browser-friendly JSON, public) ----------
@@ -139,16 +144,15 @@ async def homedepot_pdp_get_by_id(
 
     url = f"https://www.homedepot.com/p/{pro_id}"
 
-    req = PDPRequest(
-        urls=[url],
-        store_id=store_id,
-        zip_code=zip_code,
-        use_cache=use_cache,
-    )
+    # ---- OLD JSON VERSION ----
+    # req = PDPRequest(urls=[url],store_id=store_id,zip_code=zip_code,use_cache=use_cache,)
+    # result = await process(url, req)
+    # if result.status != "success":
+    #     return JSONResponse(status_code=502, content=result.model_dump())
+    # return result.model_dump()
 
-    result = await process(url, req)
-
-    if result.status != "success":
-        return JSONResponse(status_code=502, content=result.model_dump())
-
-    return result.model_dump()
+    # ---- NEW HTML VERSION ----
+    res = await fetch_html(url, store_id, zip_code)
+    if not res["status"].startswith("success"):
+        return PlainTextResponse(res.get("error") or "failed", status_code=502)
+    return HTMLResponse(content=res["data"])
