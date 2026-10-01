@@ -91,6 +91,11 @@ async def fetch_html(url: str, store_id: str | None, zip_code: str | None):
 PRODUCT_ID_RE = re.compile(r"/(\d{6,})(?:[/?#]|$)")
 
 
+def safe_header(v) -> str:
+    """Header value: single line, printable ASCII only, short."""
+    return re.sub(r"[^\x20-\x7E]+", " ", str(v)).strip()[:150]
+
+
 def pdp_json_response(res: dict, url: str, store_id: str | None, zip_code: str | None):
     """Final response format: {success, status, product_id, store_id, zip_code, html}."""
     m = PRODUCT_ID_RE.search(url)
@@ -99,7 +104,8 @@ def pdp_json_response(res: dict, url: str, store_id: str | None, zip_code: str |
         "store_id": store_id,
         "zip_code": zip_code,
     }
-    headers = {"X-Stock-Status": str(res.get("stock_status", "n/a"))}
+    # headers = {"X-Stock-Status": str(res.get("stock_status", "n/a"))}
+    headers = {"X-Stock-Status": safe_header(res.get("stock_status", "n/a"))}
 
     if not res["status"].startswith("success"):
         return JSONResponse(
