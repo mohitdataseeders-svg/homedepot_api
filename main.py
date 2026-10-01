@@ -1,4 +1,4 @@
-"""FastAPI app: POST list of HomeDepot PDP URLs (stream) + GET single URL (browser-friendly)."""
+"""FastAPI app: POST list of HomeDepot PDP URLs (stream) + GET single URL / product id -> JSON {success, product_id, store_id, zip_code, html}."""
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -12,7 +12,7 @@ from fastapi.security import APIKeyHeader
 from config import settings
 from schemas import PDPRequest, PDPResponse, PDPResult
 from scraper.homedepot_pdp import scrape_pdp
-from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
+import re
 
 state: dict = {}
 
@@ -88,6 +88,28 @@ async def fetch_html(url: str, store_id: str | None, zip_code: str | None):
     return res
 
 
+PRODUCT_ID_RE = re.compile(r"/(\d{6,})(?:[/?#]|$)")
+
+
+def pdp_json_response(res: dict, url: str, store_id: str | None, zip_code: str | None):
+    """Final response format: {success, product_id, store_id, zip_code, html}."""
+    m = PRODUCT_ID_RE.search(url)
+    base = {
+        "product_id": m.group(1) if m else None,
+        "store_id": store_id,
+        "zip_code": zip_code,
+    }
+    # stock_status header me jaata hai (body ka format fixed rehta hai)
+    headers = {"X-Stock-Status": str(res.get("stock_status", "n/a"))}
+    if not res["status"].startswith("success"):
+        return JSONResponse(
+            status_code=502,
+            content={"success": False, **base, "error": res.get("error") or "failed"},
+            headers=headers,
+        )
+    return JSONResponse(content={"success": True, **base, "html": res["data"]}, headers=headers)
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -124,11 +146,10 @@ async def homedepot_pdp_get(
     #     return JSONResponse(status_code=502, content=result.model_dump())
     # return result.model_dump()
 
-    # ---- NEW HTML VERSION ----
+    # ---- NEW JSON(html) VERSION ----
+    url = unquote(url)
     res = await fetch_html(url, store_id, zip_code)
-    if not res["status"].startswith("success"):
-        return PlainTextResponse(res.get("error") or "failed", status_code=502)
-    return HTMLResponse(content=res["data"])
+    return pdp_json_response(res, url, store_id, zip_code)
 
 
 # ---------- GET by PRODUCT ID (browser-friendly JSON, public) ----------
@@ -151,8 +172,6 @@ async def homedepot_pdp_get_by_id(
     #     return JSONResponse(status_code=502, content=result.model_dump())
     # return result.model_dump()
 
-    # ---- NEW HTML VERSION ----
+    # ---- NEW JSON(html) VERSION ----
     res = await fetch_html(url, store_id, zip_code)
-    if not res["status"].startswith("success"):
-        return PlainTextResponse(res.get("error") or "failed", status_code=502)
-    return HTMLResponse(content=res["data"])
+    return pdp_json_response(res, url, store_id, zip_code)
