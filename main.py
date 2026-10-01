@@ -92,22 +92,32 @@ PRODUCT_ID_RE = re.compile(r"/(\d{6,})(?:[/?#]|$)")
 
 
 def pdp_json_response(res: dict, url: str, store_id: str | None, zip_code: str | None):
-    """Final response format: {success, product_id, store_id, zip_code, html}."""
+    """Final response format: {success, status, product_id, store_id, zip_code, html}."""
     m = PRODUCT_ID_RE.search(url)
     base = {
         "product_id": m.group(1) if m else None,
         "store_id": store_id,
         "zip_code": zip_code,
     }
-    # stock_status header me jaata hai (body ka format fixed rehta hai)
     headers = {"X-Stock-Status": str(res.get("stock_status", "n/a"))}
+
     if not res["status"].startswith("success"):
         return JSONResponse(
             status_code=502,
-            content={"success": False, **base, "error": res.get("error") or "failed"},
+            content={
+                "success": False,
+                "status": 502,
+                **base,
+                "error": res.get("error") or "failed",
+            },
             headers=headers,
         )
-    return JSONResponse(content={"success": True, **base, "html": res["data"]}, headers=headers)
+
+    return JSONResponse(
+        status_code=200,
+        content={"success": True, "status": 200, **base, "html": res["data"]},
+        headers=headers,
+    )
 
 
 @app.get("/health")
