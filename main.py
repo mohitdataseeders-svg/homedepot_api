@@ -128,7 +128,26 @@ def pdp_json_response(res: dict, url: str, store_id: str | None, zip_code: str |
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    credits_info = {}
+    token = getattr(settings, "scrape_do_token", None)
+
+    if token:
+        try:
+            resp = await state["client"].get(
+                "https://api.scrape.do/info",
+                params={"token": token},
+            )
+            data = resp.json()
+            credits_info = {
+                "scrape_do_active": data.get("IsActive"),
+                "scrape_do_remaining_monthly_requests": data.get("RemainingMonthlyRequest"),
+                "scrape_do_max_monthly_requests": data.get("MaxMonthlyRequest"),
+                "scrape_do_remaining_concurrent": data.get("RemainingConcurrentRequest"),
+            }
+        except Exception as e:
+            credits_info = {"scrape_do_error": str(e)}
+
+    return {"status": "ok", **credits_info}
 
 
 # ---------- POST (batch, streaming NDJSON) ----------
