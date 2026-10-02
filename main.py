@@ -129,7 +129,7 @@ def pdp_json_response(res: dict, url: str, store_id: str | None, zip_code: str |
 @app.get("/health")
 async def health():
     credits_info = {}
-    token = getattr(settings, "scrape_do_token", None)
+    token = settings.scrapedo_token
 
     if token:
         try:
