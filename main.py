@@ -8,6 +8,7 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from config import settings
 from schemas import PDPRequest, PDPResponse, PDPResult
@@ -126,6 +127,27 @@ def pdp_json_response(res: dict, url: str, store_id: str | None, zip_code: str |
     )
 
 
+def pdp_html_response(res: dict, url: str, store_id: str | None, zip_code: str | None):
+    """Client ko sirf raw HTML chahiye -- no JSON wrapper, no success/status/product_id fields.
+    Success: raw PDP HTML, status 200.
+    Failure: short plain error text, status 502.
+    (Stock status still goes in the X-Stock-Status header for debugging, not in the body.)"""
+    headers = {"X-Stock-Status": safe_header(res.get("stock_status", "n/a"))}
+
+    if not res["status"].startswith("success"):
+        return HTMLResponse(
+            content=res.get("error") or "failed",
+            status_code=502,
+            headers=headers,
+        )
+
+    return HTMLResponse(
+        content=res["data"],
+        status_code=200,
+        headers=headers,
+    )
+
+
 @app.get("/health")
 async def health():
     credits_info = {}
@@ -184,7 +206,8 @@ async def homedepot_pdp_get(
     # ---- NEW JSON(html) VERSION ----
     url = unquote(url)
     res = await fetch_html(url, store_id, zip_code)
-    return pdp_json_response(res, url, store_id, zip_code)
+    # return pdp_json_response(res, url, store_id, zip_code)
+    return pdp_html_response(res, url, store_id, zip_code)
 
 
 # ---------- GET by PRODUCT ID (browser-friendly JSON, public) ----------
@@ -209,4 +232,5 @@ async def homedepot_pdp_get_by_id(
 
     # ---- NEW JSON(html) VERSION ----
     res = await fetch_html(url, store_id, zip_code)
-    return pdp_json_response(res, url, store_id, zip_code)
+    # return pdp_json_response(res, url, store_id, zip_code)
+    return pdp_html_response(res, url, store_id, zip_code)
