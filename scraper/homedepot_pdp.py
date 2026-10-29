@@ -712,7 +712,8 @@ async def fetch_stock(
                 prod = (body.get("data") or {}).get("product")
                 if prod and prod.get("fulfillment"):
                     return {"status": "success", "product": prod}
-                last_err = f"no product/fulfillment in response: {str(body.get('errors'))[:200]}"
+                # last_err = f"no product/fulfillment in response: {str(body.get('errors'))[:200]}"
+                last_err = f"HTTP {r.status_code}: {r.text[:1000]}"
             else:
                 last_err = f"HTTP {r.status_code}: {r.text[:200]}"
                 if r.status_code in (400, 401, 404):
@@ -958,6 +959,16 @@ async def scrape_pdp(
             if res["status"].startswith("success"):
                 res["stock_status"] = "skipped (no store_id)"
             return res
+
+        # res, stock = await asyncio.gather(
+        #     _fetch_html(url, store_id, zip_code, client),
+        #     fetch_stock(url, store_id, zip_code, client),
+        # )
+        # if not res["status"].startswith("success"):
+        #     return res
+        # if stock["status"] != "success":
+        #     res["stock_status"] = f"failed: {stock['error']}"
+        #     return res
 
         res, stock = await asyncio.gather(
             _fetch_html(url, store_id, zip_code, client),
