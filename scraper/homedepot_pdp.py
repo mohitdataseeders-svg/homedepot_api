@@ -74,16 +74,25 @@ def c_replace(html=""):
         return html
 
 
-# def build_scrapedo_url(url: str, store_id: str | None, zip_code: str | None) -> str:
-#     params = f"token={settings.scrapedo_token}&url={quote(url, safe='')}&geoCode=us"
-#     cookies = []
-#     if store_id:
-#         cookies.append(f"THD_PERSIST=C4%3D{store_id}%2B%2B%3BC4_EXP%3D9999999999")
-#     if zip_code:
-#         cookies.append(f"THD_LOCALIZER=%7B%22WORKFLOW%22%3A%22LOCALIZED_BY_ZIP%22%7D")
-#     if cookies:
-#         params += "&setCookies=" + quote(";".join(cookies), safe="")
-#     return f"{SCRAPEDO}?{params}"
+STORESEARCH_URL = "https://www.homedepot.com/StoreSearchServices/v2/storesearch"
+
+
+def build_scrapedo_get_url(target_url: str) -> str:
+    params = f"token={settings.scrapedo_token}&url={quote(target_url, safe='')}&geoCode=us"
+    return f"{SCRAPEDO}?{params}"
+
+
+async def lookup_store(store_id: str, client: httpx.AsyncClient) -> dict | None:
+    """StoreSearchServices se poora store object laata hai, jaisa tumne curl me dikhaya."""
+    url = f"{STORESEARCH_URL}?storeid={store_id}&type=json"
+    try:
+        r = await client.get(build_scrapedo_get_url(url))
+        if r.status_code != 200:
+            return None
+        stores = (r.json() or {}).get("stores") or []
+        return stores[0] if stores else None   # pura raw object, sab fields ke saath
+    except Exception:
+        return None
 
 def build_scrapedo_url(url: str, store_id: str | None, zip_code: str | None) -> str:
     params = f"token={settings.scrapedo_token}&url={quote(url, safe='')}&geoCode=us"
@@ -768,6 +777,12 @@ def _dump_js_safe(obj) -> str:
     # compact JSON, "</script>" se HTML na toote
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).replace("</", "<\\/")
 
+def inject_store_search_block(html: str, store: dict) -> str:
+    """StoreSearchServices ka poora response ek <script> tag ke andar HTML me daal deta hai."""
+    block = f'<script id="store-search-data" type="application/json">{_dump_js_safe(store)}</script>'
+    k = html.lower().rfind("</body>")
+    return (html[:k] + block + html[k:]) if k != -1 else (html + block)
+
 
 def _splice_json_assign(html: str, marker_re: str, mutate) -> tuple[str, bool]:
     """'window.X = {json}' dhoondho, json parse karo, mutate(obj) chalao, wapas usi jagah likho."""
@@ -946,49 +961,35 @@ async def scrape_pdp(
     zip_code: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> dict:
-    """PDP HTML + (store_id ho to) store-wise stock/price request, dono ek saath.
-    Stock ka data HTML me inject hoke wapas aata hai. Result me extra keys:
-      stock_status: "ok" | "skipped (no store_id)" | "failed: ..."
-      inject_warnings: injection ke dauran kisi step me dikkat aayi to list
-    """
     own_client = client is None
     client = client or httpx.AsyncClient(timeout=settings.request_timeout)
+    last_err = "unknown error"
     try:
-        if not store_id:
-            res = await _fetch_html(url, store_id, zip_code, client)
-            if res["status"].startswith("success"):
-                res["stock_status"] = "skipped (no store_id)"
-            return res
+        store_info = None
+        if store_id:
+            store_info = await lookup_store(store_id, client)
+            if store_info is None:
+                return {
+                    "url": url,
+                    "status": "failed",
+                    "error": f"store_id {store_id} not found via StoreSearchServices",
+                }
 
-        # res, stock = await asyncio.gather(
-        #     _fetch_html(url, store_id, zip_code, client),
-        #     fetch_stock(url, store_id, zip_code, client),
-        # )
-        # if not res["status"].startswith("success"):
-        #     return res
-        # if stock["status"] != "success":
-        #     res["stock_status"] = f"failed: {stock['error']}"
-        #     return res
-
-        res, stock = await asyncio.gather(
-            _fetch_html(url, store_id, zip_code, client),
-            fetch_stock(url, store_id, zip_code, client),
-        )
-        if not res["status"].startswith("success"):
-            return res
-        if stock["status"] != "success":
-            res["stock_status"] = f"failed: {stock['error']}"
-            return res
-
-        # 800KB HTML + json parse/dump -> alag thread me, event loop block na ho
-        html, warns = await asyncio.to_thread(
-            inject_store_stock, res["data"], url, stock["product"], store_id, zip_code
-        )
-        res["data"] = html
-        res["stock_status"] = "ok"
-        if warns:
-            res["inject_warnings"] = warns
-        return res
+        for attempt in range(1, settings.retries + 1):
+            try:
+                r = await client.get(build_scrapedo_url(url, store_id, zip_code))
+                if r.status_code == 200:
+                    html = r.text
+                    if store_info:
+                        html = inject_store_search_block(html, store_info)
+                    return {"url": url, "status": "success 200", "data": html}
+                last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+                if r.status_code in (400, 401, 404):
+                    break
+            except Exception as e:  # noqa: BLE001
+                last_err = f"{type(e).__name__}: {e}"
+            await asyncio.sleep(0.5 * attempt)
+        return {"url": url, "status": "failed", "error": last_err}
     finally:
         if own_client:
             await client.aclose()
