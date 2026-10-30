@@ -115,11 +115,16 @@ def _graphql_payload(query: str, item_id: str, store_id: str, zip_code: str | No
 # Har round me 2 requests ek saath (full + lite) -> jo pehle sahi aaye wo use.
 GRAPHQL_ROUNDS = 3
 
+# True  -> GraphQL request scrape.do ke through jaati hai
+# False -> GraphQL request seedha apionline.homedepot.com pe (bina scrape.do)
+GRAPHQL_USE_SCRAPEDO = True
+
 
 async def _graphql_once(name, item_id, store_id, zip_code, client) -> dict:
     query = PRODUCT_QUERY if name == "full" else STOCK_QUERY_LITE
     try:
-        r = await client.post(build_scrapedo_post_url(), json=_graphql_payload(query, item_id, store_id, zip_code),
+        target = build_scrapedo_post_url() if GRAPHQL_USE_SCRAPEDO else GRAPHQL_URL
+        r = await client.post(target, json=_graphql_payload(query, item_id, store_id, zip_code),
                               headers=_graphql_headers(item_id))
         try:
             body = r.json()
@@ -127,7 +132,8 @@ async def _graphql_once(name, item_id, store_id, zip_code, client) -> dict:
             body = {}
         prod = (body.get("data") or {}).get("product")
         if prod and prod.get("fulfillment"):
-            return {"status": "success", "body": body, "product": prod, "via": name}
+            via = name + ("" if GRAPHQL_USE_SCRAPEDO else " direct")
+            return {"status": "success", "body": body, "product": prod, "via": via}
         return {"status": "failed", "error": f"{name}: HTTP {r.status_code} {r.text[:80]}"}
     except Exception as e:  # noqa: BLE001
         return {"status": "failed", "error": f"{name}: {type(e).__name__}: {e}"}
