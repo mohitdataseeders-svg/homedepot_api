@@ -900,6 +900,36 @@ def inject_store_stock(
     return html, warnings
 
 
+def patch_store_context(html: str, store_id: str, store_info: dict, zip_code: str | None) -> str:
+    """GraphQL fail ho tab bhi page ka store context sahi store pe set karo."""
+    addr = store_info.get("address") or {}
+    name = store_info.get("name") or store_info.get("storeName") or ""
+    szip = (addr.get("postalCode") or store_info.get("zipCode") or "")[:5]
+
+    i = html.find("window.__EXPERIENCE_CONTEXT__")
+    if i != -1:
+        j = html.find("</script>", i)
+        seg = html[i:j]
+        seg = re.sub(r'("storeId"\s*:\s*")[^"]*(")', lambda m: m.group(1) + str(store_id) + m.group(2), seg)
+        seg = re.sub(r'("storeName"\s*:\s*")[^"]*(")', lambda m: m.group(1) + name + m.group(2), seg)
+        seg = re.sub(r'("storeZip"\s*:\s*")[^"]*(")', lambda m: m.group(1) + szip + m.group(2), seg)
+        seg = re.sub(r'("localStoreZip"\s*:\s*")[^"]*(")', lambda m: m.group(1) + szip + m.group(2), seg)
+        if zip_code:
+            seg = re.sub(r'("deliveryZip"\s*:\s*")[^"]*(")', lambda m: m.group(1) + zip_code + m.group(2), seg)
+        html = html[:i] + seg + html[j:]
+
+    def mut_ops(ops):
+        for op in ops.get("operations", []):
+            v = op.get("variables")
+            if isinstance(v, dict) and "storeId" in v:
+                v["storeId"] = str(store_id)
+    try:
+        html, _ = _splice_json_assign(html, r"__APOLLO_OPERATIONS\s*=\s*", mut_ops)
+    except Exception:
+        pass
+    return html
+
+
 async def _fetch_pdp_html(url, store_id, zip_code, client) -> dict:
     last_err = "unknown error"
     for attempt in range(1, settings.retries + 1):
@@ -946,6 +976,7 @@ async def scrape_pdp(url, store_id=None, zip_code=None, client=None) -> dict:
         else:
             stock_status = f"stock failed: {stock['error'][:100]}"
 
+        html = patch_store_context(html, store_id, store_info, zip_code)   # <- naya
         html = inject_store_search_block(html, store_info)
         return {"url": url, "status": "success 200", "data": html,
                 "stock_status": stock_status, "inject_warnings": warnings}
