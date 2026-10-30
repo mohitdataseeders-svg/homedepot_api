@@ -1,5 +1,7 @@
 """HomeDepot PDP scraper.
 
+GraphQL fail (206) ho to 4 tarike try hote hain: full query, lite query, phir dono super proxy ke saath.
+
 Har request pe sirf 2 calls (dono parallel, scrape.do se):
   1) PDP HTML                      -> www.homedepot.com/p/<id>
   2) GraphQL productClientOnlyProduct (storeId + zipCode ke saath)
@@ -18,6 +20,7 @@ import asyncio
 import json
 import re
 import sys
+import uuid
 from urllib.parse import quote
 
 import httpx
@@ -48,11 +51,6 @@ def build_scrapedo_url(url: str, store_id: str | None, zip_code: str | None) -> 
     return f"{SCRAPEDO}?{params}"
 
 
-def build_scrapedo_post_url() -> str:
-    return (f"{SCRAPEDO}?token={settings.scrapedo_token}"
-            f"&url={quote(GRAPHQL_URL, safe='')}&geoCode=us&customHeaders=true")
-
-
 # ───────────────────────── request 1: PDP HTML ─────────────────────────
 async def fetch_pdp_html(url, store_id, zip_code, client) -> dict:
     last_err = "unknown error"
@@ -71,54 +69,87 @@ async def fetch_pdp_html(url, store_id, zip_code, client) -> dict:
 
 
 # ───────────────────────── request 2: GraphQL (stock/store/zip) ─────────────────────────
-async def fetch_graphql(item_id, store_id, zip_code, client) -> dict:
-    payload = {
-        "operationName": "productClientOnlyProduct",
-        "variables": {
-            "skipInstallServices": True,
-            "skipFavoriteCount": False,
-            "skipSubscribeAndSave": False,
-            "skipPaintDetails": True,
-            "skipSpecificationGroup": False,
-            "skipKPF": False,
-            "isBrandPricingPolicyCompliant": False,
-            "itemId": item_id,
-            "loyaltyMembershipInput": None,
-            "storeId": store_id,
-            "zipCode": zip_code,
-        },
-        "query": PRODUCT_QUERY,
-    }
-    headers = {
+# Chhoti query: sirf pricing / badges / availability / fulfillment (stock).
+# Ye pehle local pe chal chuki hai ("injected" aaya tha).
+STOCK_QUERY_LITE = 'query productClientOnlyProduct($itemId: String!, $loyaltyMembershipInput: LoyaltyMembershipInput, $dataSource: String, $storeId: String, $isBrandPricingPolicyCompliant: Boolean, $zipCode: String, $quantity: Int) {\n  product(itemId: $itemId, loyaltyMembershipInput: $loyaltyMembershipInput, dataSource: $dataSource) {\n    itemId\n    availabilityType {\n      type\n      discontinued\n      status\n      buyable\n      __typename\n    }\n    pricing(\n      storeId: $storeId\n      isBrandPricingPolicyCompliant: $isBrandPricingPolicyCompliant\n    ) {\n      value\n      unitOfMeasure\n      alternatePriceDisplay\n      message\n      original\n      mapAboveOriginalPrice\n      promotion {\n        dollarOff\n        type\n        description {\n          shortDesc\n          longDesc\n          __typename\n        }\n        percentageOff\n        promotionTag\n        savingsCenter\n        savingsCenterPromos\n        specialBuySavings\n        specialBuyDollarOff\n        specialBuyPercentageOff\n        dates {\n          end\n          start\n          __typename\n        }\n        experienceTag\n        subExperienceTag\n        __typename\n      }\n      alternate {\n        bulk {\n          pricePerUnit\n          thresholdQuantity\n          value\n          __typename\n        }\n        unit {\n          caseUnitOfMeasure\n          unitsOriginalPrice\n          unitsPerCase\n          value\n          __typename\n        }\n        __typename\n      }\n      mapDetail {\n        percentageOff\n        dollarOff\n        effectiveMap\n        mapPolicy\n        mapOriginalPriceViolation\n        mapSpecialPriceViolation\n        __typename\n      }\n      preferredPriceFlag\n      specialBuy\n      clearance {\n        value\n        dollarOff\n        percentageOff\n        unitsClearancePrice\n        __typename\n      }\n      conditionalPromotions {\n        experienceTag\n        promotionId\n        skuItemGroup\n        promotionTags\n        eligibilityCriteria {\n          itemGroup\n          minThresholdVal\n          thresholdType\n          minPurchaseAmount\n          minPurchaseQuantity\n          relatedSkusCount\n          omsSkus\n          __typename\n        }\n        reward {\n          tiers {\n            minThresholdVal\n            thresholdType\n            rewardVal\n            rewardType\n            rewardLevel\n            maxAllowedRewardAmount\n            minPurchaseAmount\n            minPurchaseQuantity\n            rewardPercent\n            rewardAmountPerOrder\n            rewardAmountPerItem\n            rewardFixedPrice\n            maxPurchaseQuantity\n            __typename\n          }\n          __typename\n        }\n        dates {\n          start\n          end\n          __typename\n        }\n        description {\n          shortDesc\n          longDesc\n          __typename\n        }\n        subExperienceTag\n        nvalues\n        brandRefinementId\n        __typename\n      }\n      __typename\n    }\n    badges(storeId: $storeId) {\n      name\n      label\n      endDate\n      color\n      creativeImageUrl\n      message\n      timerDuration\n      timer {\n        timeBombThreshold\n        daysLeftThreshold\n        dateDisplayThreshold\n        message\n        __typename\n      }\n      __typename\n    }\n    fulfillment(storeId: $storeId, zipCode: $zipCode, quantity: $quantity) {\n      fulfillmentOptions {\n        services {\n          type\n          locations {\n            isAnchor\n            inventory {\n              quantity\n              isOutOfStock\n              isInStock\n              isLimitedQuantity\n              isUnavailable\n              maxAllowedBopisQty\n              minAllowedBopisQty\n              __typename\n            }\n            curbsidePickupFlag\n            isBuyInStoreCheckNearBy\n            distance\n            locationId\n            state\n            storeName\n            storePhone\n            type\n            storeTimeZone\n            __typename\n          }\n          deliveryTimeline\n          deliveryDates {\n            startDate\n            endDate\n            __typename\n          }\n          deliveryCharge\n          dynamicEta {\n            hours\n            minutes\n            __typename\n          }\n          hasFreeShipping\n          freeDeliveryThreshold\n          totalCharge\n          deliveryMessage\n          earliestDeliveryDate\n          shipFromFastestLocation\n          optimalFulfillment\n          ffaFallbackMode\n          hasSameDayCarDelivery\n          shipFromFastestLocationType\n          sameDayDeliveryCharge\n          __typename\n        }\n        type\n        fulfillable\n        priorityDeliveryOptions {\n          date\n          timeline\n          totalCharge\n          type\n          __typename\n        }\n        programInclusions {\n          description\n          threshold\n          __typename\n        }\n        __typename\n      }\n      anchorStoreStatus\n      anchorStoreStatusType\n      backordered\n      backorderedShipDate\n      bossExcludedShipStates\n      excludedShipStates\n      seasonStatusEligible\n      onlineStoreStatus\n      onlineStoreStatusType\n      sthExcludedShipState\n      fulfillmentBundleMessage\n      bundleComponents {\n        id\n        quantity\n        fulfillmentOptions {\n          type\n          availableFulfillmentTypes\n          __typename\n        }\n        __typename\n      }\n      fallbackMode\n      bossExcludedShipState\n      apoFpoEligible\n      inStoreAssemblyEligible\n      bodfsAssemblyEligible\n      __typename\n    }\n    __typename\n  }\n}'
+
+
+def build_scrapedo_post_url(super_proxy: bool = False) -> str:
+    u = (f"{SCRAPEDO}?token={settings.scrapedo_token}"
+         f"&url={quote(GRAPHQL_URL, safe='')}&geoCode=us&customHeaders=true")
+    return u + "&super=true" if super_proxy else u
+
+
+def _graphql_headers(item_id: str) -> dict:
+    return {
         "accept": "*/*",
         "accept-language": "en-US,en;q=0.9",
         "content-type": "application/json",
         "origin": "https://www.homedepot.com",
         "referer": "https://www.homedepot.com/",
         "user-agent": UA,
+        "sec-ch-ua": '"Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+        "x-api-cookies": json.dumps({"x-user-id": str(uuid.uuid4())}),
         "x-current-url": f"/p/{item_id}",
         "x-debug": "false",
         "x-experience-name": "fusion-gm-pip-desktop",
         "x-hd-dc": "origin",
+        "x-thd-customer-token": "",
     }
-    last_err = "unknown error"
-    for attempt in range(1, settings.retries + 1):
+
+
+def _graphql_payload(query: str, item_id: str, store_id: str, zip_code: str | None) -> dict:
+    variables = {
+        "isBrandPricingPolicyCompliant": False,
+        "itemId": item_id,
+        "loyaltyMembershipInput": None,
+        "storeId": store_id,
+        "zipCode": zip_code,
+    }
+    if query is PRODUCT_QUERY:
+        variables.update({
+            "skipInstallServices": True, "skipFavoriteCount": False,
+            "skipSubscribeAndSave": False, "skipPaintDetails": True,
+            "skipSpecificationGroup": False, "skipKPF": False,
+        })
+    return {"operationName": "productClientOnlyProduct", "variables": variables, "query": query}
+
+
+# HTTP 206 "Generic Errors API" aaye to agla tarika try hota hai:
+#   full query -> lite query -> full + super proxy -> lite + super proxy
+GRAPHQL_ATTEMPTS = [
+    ("full", False),
+    ("lite", False),
+    ("full", True),
+    ("lite", True),
+]
+
+
+async def fetch_graphql(item_id, store_id, zip_code, client) -> dict:
+    errors = []
+    for name, super_proxy in GRAPHQL_ATTEMPTS:
+        query = PRODUCT_QUERY if name == "full" else STOCK_QUERY_LITE
+        payload = _graphql_payload(query, item_id, store_id, zip_code)
+        label = name + ("+super" if super_proxy else "")
         try:
-            r = await client.post(build_scrapedo_post_url(), json=payload, headers=headers)
+            r = await client.post(build_scrapedo_post_url(super_proxy), json=payload,
+                                  headers=_graphql_headers(item_id))
             try:
                 body = r.json()
             except Exception:  # noqa: BLE001
                 body = {}
             prod = (body.get("data") or {}).get("product")
             if prod and prod.get("fulfillment"):
-                return {"status": "success", "body": body, "product": prod}
-            last_err = f"HTTP {r.status_code}: {r.text[:300]}"
-            if r.status_code in (400, 401):
-                break
+                return {"status": "success", "body": body, "product": prod, "via": label}
+            errors.append(f"{label}: HTTP {r.status_code} {r.text[:120]}")
         except Exception as e:  # noqa: BLE001
-            last_err = f"{type(e).__name__}: {e}"
-        await asyncio.sleep(0.5 * attempt)
-    return {"status": "failed", "error": last_err}
+            errors.append(f"{label}: {type(e).__name__}: {e}")
+    return {"status": "failed", "error": " | ".join(errors)}
 
 
 # ───────────────────────── GraphQL data -> HTML ─────────────────────────
@@ -241,7 +272,7 @@ async def scrape_pdp(url: str, store_id: str | None = None, zip_code: str | None
                     "error": f"graphql failed: {gql['error']}", "stock_status": "graphql failed"}
 
         html = apply_graphql_to_html(pdp["html"], item_id, gql["product"], gql["body"], store_id, zip_code)
-        return {"url": url, "status": "success 200", "data": html, "stock_status": "graphql injected"}
+        return {"url": url, "status": "success 200", "data": html, "stock_status": f"graphql injected ({gql['via']})"}
     finally:
         if own_client:
             await client.aclose()
