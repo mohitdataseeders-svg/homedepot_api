@@ -100,14 +100,31 @@ def apply_store_to_html(html: str, store: dict, store_id: str, zip_code: str | N
         return re.sub(rf'("{key}"\s*:\s*")[^"]*(")',
                       lambda m: m.group(1) + val + m.group(2), seg)
 
-    # 1) __EXPERIENCE_CONTEXT__
+    # 1) __EXPERIENCE_CONTEXT__ -> poora "store": {...} object StoreSearch data se replace
     i = html.find("window.__EXPERIENCE_CONTEXT__")
     if i != -1:
         j = html.find("</script>", i)
         seg = html[i:j]
-        seg = sub(seg, "storeId", sid)
-        seg = sub(seg, "storeName", name)
-        seg = sub(seg, "storeZip", szip)
+        new_store = {
+            "storeHours": store.get("storeHours") or {},
+            "storeId": sid,
+            "storeName": name,
+            "storeZip": szip,
+        }
+        m_store = re.search(r'"store"\s*:\s*\{', seg)
+        replaced = False
+        if m_store:
+            try:
+                s = m_store.end() - 1
+                _, n = json.JSONDecoder().raw_decode(seg[s:])
+                seg = seg[:s] + _dump_js_safe(new_store) + seg[s + n:]
+                replaced = True
+            except Exception:  # noqa: BLE001
+                pass
+        if not replaced:  # fallback: sirf fields replace
+            seg = sub(seg, "storeId", sid)
+            seg = sub(seg, "storeName", name)
+            seg = sub(seg, "storeZip", szip)
         seg = sub(seg, "localStoreZip", szip)
         if zip_code:
             seg = sub(seg, "deliveryZip", zip_code)
