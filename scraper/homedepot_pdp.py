@@ -1,18 +1,18 @@
-"""HomeDepot PDP scraper (simple version).
+"""HomeDepot PDP scraper.
 
-Sirf 2 requests (dono parallel):
-  1) PDP HTML (scrape.do)
-  2) StoreSearchServices -> store ka poora data
+Har request pe sirf 2 calls (dono parallel, scrape.do se):
+  1) PDP HTML                      -> www.homedepot.com/p/<id>
+  2) GraphQL productClientOnlyProduct (storeId + zipCode ke saath)
+                                   -> apionline.homedepot.com/federation-gateway/graphql
 
-StoreSearch ka data HTML me:
-  - __EXPERIENCE_CONTEXT__ me storeId / storeName / storeZip / localStoreZip / deliveryZip replace
-  - __APOLLO_OPERATIONS me storeId replace
-  - </body> se pehle <script id="store-search-data"> me poora raw response
-
-Never raises: hamesha {"status": ...} dict return karta hai.
+GraphQL ka store-wise data HTML me daala jaata hai:
+  - __APOLLO_STATE__   : pricing / badges / fulfillment (stock) / availabilityType
+  - __EXPERIENCE_CONTEXT__ : storeId / storeName / storeZip / localStoreZip / deliveryZip
+  - __APOLLO_OPERATIONS    : storeId
+  - </body> se pehle <script id="graphql-product-data"> me poora GraphQL response
 
 Test:
-    python -m scraper.homedepot_pdp <pdp_url> [store_id] [zip_code]
+    python -m scraper.homedepot_pdp https://www.homedepot.com/p/342938293 115 30360
 """
 import asyncio
 import json
@@ -25,14 +25,16 @@ import httpx
 from config import settings
 
 SCRAPEDO = "https://api.scrape.do/"
-STORESEARCH_URL = "https://www.homedepot.com/StoreSearchServices/v2/storesearch"
+GRAPHQL_URL = "https://apionline.homedepot.com/federation-gateway/graphql?opname=productClientOnlyProduct"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36")
+ITEM_ID_RE = re.compile(r"/(\d{6,})(?:[/?#]|$)")
+
+# Browser wali exact query (bina trim kiye)
+PRODUCT_QUERY = 'query productClientOnlyProduct($itemId: String!, $loyaltyMembershipInput: LoyaltyMembershipInput, $dataSource: String, $storeId: String, $isBrandPricingPolicyCompliant: Boolean, $zipCode: String, $skipInstallServices: Boolean = true, $quantity: Int, $skipFavoriteCount: Boolean = false, $skipSubscribeAndSave: Boolean = false, $configId: String, $skipPaintDetails: Boolean = true, $skipSpecificationGroup: Boolean = false, $skipKPF: Boolean = false) {\n  product(\n    itemId: $itemId\n    loyaltyMembershipInput: $loyaltyMembershipInput\n    dataSource: $dataSource\n  ) {\n    dataSources\n    identifiers {\n      productType\n      storeSkuNumber\n      brandName\n      productLabel\n      canonicalUrl\n      itemId\n      parentId\n      omsThdSku\n      specialOrderSku\n      isSuperSku\n      sampleId\n      brandMainPageUrl\n      skuClassification\n      modelNumber\n      toolRentalSkuNumber\n      rentalCategory\n      rentalSubCategory\n      upc\n      upcGtin13\n      roomVOEnabled\n      __typename\n    }\n    availabilityType {\n      type\n      discontinued\n      status\n      buyable\n      __typename\n    }\n    media {\n      images {\n        url\n        type\n        subType\n        sizes\n        hotspots {\n          coordinate {\n            xCoordinate\n            yCoordinate\n            __typename\n          }\n          omsIDs\n          __typename\n        }\n        ocrHotspots {\n          coordinate {\n            xCoordinate\n            yCoordinate\n            __typename\n          }\n          omsIDs\n          __typename\n        }\n        altText\n        __typename\n      }\n      video {\n        link {\n          text\n          url\n          __typename\n        }\n        shortDescription\n        title\n        type\n        videoId\n        videoStill\n        url\n        thumbnail\n        longDescription\n        uploadDate\n        dateModified\n        __typename\n      }\n      threeSixty {\n        id\n        url\n        __typename\n      }\n      augmentedRealityLink {\n        usdz\n        image\n        __typename\n      }\n      __typename\n    }\n    info {\n      bathRenovation\n      label\n      isSponsored\n      sponsoredMetadata {\n        campaignId\n        placementId\n        slotId\n        sponsoredId\n        trackSource\n        __typename\n      }\n      sponsoredBeacon {\n        onClickBeacon\n        onViewBeacon\n        onClickBeacons\n        onViewBeacons\n        __typename\n      }\n      productSubType {\n        name\n        link\n        __typename\n      }\n      augmentedReality\n      globalCustomConfigurator {\n        customExperience\n        customButtonText\n        customDescription\n        customExperienceUrl\n        customTitle\n        customPosition\n        __typename\n      }\n      isLiveGoodsProduct\n      hidePrice\n      ecoRebate\n      quantityLimit\n      categoryHierarchy\n      sskMin\n      sskMax\n      unitOfMeasureCoverage\n      wasMaxPriceRange\n      wasMinPriceRange\n      movingCalculatorEligible\n      gccExperienceOmsId\n      dotComColorEligible\n      forProfessionalUseOnly\n      replacementOMSID\n      hasVisuallySimilar\n      returnable\n      isBuryProduct\n      isGenericProduct\n      classNumber\n      hasSubscription\n      productDepartment\n      isInStoreReturnMessageEligible\n      paintBrand\n      paintFamily\n      recommendationFlags {\n        packages\n        frequentlyBoughtTogether\n        bundles\n        visualNavigation\n        pipCollections\n        ACC\n        collections\n        batItems\n        __typename\n      }\n      minimumOrderQuantity\n      projectCalculatorEligible\n      subClassNumber\n      protectionPlanSku\n      eligibleProtectionPlanSkus\n      hasServiceAddOns\n      consultationType\n      pipCalculator {\n        coverageUnits\n        display\n        publisher\n        toggle\n        defaultAdditionalCoverage\n        additionalCoveragePercentage\n        __typename\n      }\n      __typename\n    }\n    itemId\n    taxonomy {\n      breadCrumbs {\n        browseUrl\n        creativeIconUrl\n        deselectUrl\n        dimensionName\n        label\n        refinementKey\n        url\n        __typename\n      }\n      brandLinkUrl\n      __typename\n    }\n    pricing(\n      storeId: $storeId\n      isBrandPricingPolicyCompliant: $isBrandPricingPolicyCompliant\n    ) {\n      value\n      unitOfMeasure\n      alternatePriceDisplay\n      message\n      original\n      mapAboveOriginalPrice\n      promotion {\n        dollarOff\n        type\n        description {\n          shortDesc\n          longDesc\n          __typename\n        }\n        percentageOff\n        promotionTag\n        savingsCenter\n        savingsCenterPromos\n        specialBuySavings\n        specialBuyDollarOff\n        specialBuyPercentageOff\n        dates {\n          end\n          start\n          __typename\n        }\n        experienceTag\n        subExperienceTag\n        __typename\n      }\n      alternate {\n        bulk {\n          pricePerUnit\n          thresholdQuantity\n          value\n          __typename\n        }\n        unit {\n          caseUnitOfMeasure\n          unitsOriginalPrice\n          unitsPerCase\n          value\n          __typename\n        }\n        __typename\n      }\n      mapDetail {\n        percentageOff\n        dollarOff\n        effectiveMap\n        mapPolicy\n        mapOriginalPriceViolation\n        mapSpecialPriceViolation\n        __typename\n      }\n      preferredPriceFlag\n      specialBuy\n      clearance {\n        value\n        dollarOff\n        percentageOff\n        unitsClearancePrice\n        __typename\n      }\n      conditionalPromotions {\n        experienceTag\n        promotionId\n        skuItemGroup\n        promotionTags\n        eligibilityCriteria {\n          itemGroup\n          minThresholdVal\n          thresholdType\n          minPurchaseAmount\n          minPurchaseQuantity\n          relatedSkusCount\n          omsSkus\n          __typename\n        }\n        reward {\n          tiers {\n            minThresholdVal\n            thresholdType\n            rewardVal\n            rewardType\n            rewardLevel\n            maxAllowedRewardAmount\n            minPurchaseAmount\n            minPurchaseQuantity\n            rewardPercent\n            rewardAmountPerOrder\n            rewardAmountPerItem\n            rewardFixedPrice\n            maxPurchaseQuantity\n            __typename\n          }\n          __typename\n        }\n        dates {\n          start\n          end\n          __typename\n        }\n        description {\n          shortDesc\n          longDesc\n          __typename\n        }\n        subExperienceTag\n        nvalues\n        brandRefinementId\n        __typename\n      }\n      __typename\n    }\n    dataSource\n    badges(storeId: $storeId) {\n      name\n      label\n      endDate\n      color\n      creativeImageUrl\n      message\n      timerDuration\n      timer {\n        timeBombThreshold\n        daysLeftThreshold\n        dateDisplayThreshold\n        message\n        __typename\n      }\n      __typename\n    }\n    reviews {\n      ratingsReviews {\n        totalReviews\n        averageRating\n        __typename\n      }\n      __typename\n    }\n    installServices(storeId: $storeId, zipCode: $zipCode) @skip(if: $skipInstallServices) {\n      scheduleAMeasure\n      gccCarpetDesignAndOrderEligible\n      __typename\n    }\n    fulfillment(storeId: $storeId, zipCode: $zipCode, quantity: $quantity) {\n      fulfillmentOptions {\n        services {\n          type\n          locations {\n            isAnchor\n            inventory {\n              quantity\n              isOutOfStock\n              isInStock\n              isLimitedQuantity\n              isUnavailable\n              maxAllowedBopisQty\n              minAllowedBopisQty\n              __typename\n            }\n            curbsidePickupFlag\n            isBuyInStoreCheckNearBy\n            distance\n            locationId\n            state\n            storeName\n            storePhone\n            type\n            storeTimeZone\n            __typename\n          }\n          deliveryTimeline\n          deliveryDates {\n            startDate\n            endDate\n            __typename\n          }\n          deliveryCharge\n          dynamicEta {\n            hours\n            minutes\n            __typename\n          }\n          hasFreeShipping\n          freeDeliveryThreshold\n          totalCharge\n          deliveryMessage\n          earliestDeliveryDate\n          shipFromFastestLocation\n          optimalFulfillment\n          ffaFallbackMode\n          hasSameDayCarDelivery\n          shipFromFastestLocationType\n          sameDayDeliveryCharge\n          __typename\n        }\n        type\n        fulfillable\n        priorityDeliveryOptions {\n          date\n          timeline\n          totalCharge\n          type\n          __typename\n        }\n        programInclusions {\n          description\n          threshold\n          __typename\n        }\n        __typename\n      }\n      anchorStoreStatus\n      anchorStoreStatusType\n      backordered\n      backorderedShipDate\n      bossExcludedShipStates\n      excludedShipStates\n      seasonStatusEligible\n      onlineStoreStatus\n      onlineStoreStatusType\n      sthExcludedShipState\n      fulfillmentBundleMessage\n      bundleComponents {\n        id\n        quantity\n        fulfillmentOptions {\n          type\n          availableFulfillmentTypes\n          __typename\n        }\n        __typename\n      }\n      fallbackMode\n      bossExcludedShipState\n      apoFpoEligible\n      inStoreAssemblyEligible\n      bodfsAssemblyEligible\n      __typename\n    }\n    details {\n      collection {\n        name\n        url\n        collectionId\n        __typename\n      }\n      description\n      highlights\n      installation {\n        serviceType\n        leadGenUrl\n        __typename\n      }\n      __typename\n    }\n    favoriteDetail @skip(if: $skipFavoriteCount) {\n      count\n      __typename\n    }\n    subscription @skip(if: $skipSubscribeAndSave) {\n      defaultfrequency\n      discountPercentage\n      subscriptionEnabled\n      __typename\n    }\n    bundleItems {\n      id\n      quantity\n      __typename\n    }\n    paintDetails(configId: $configId, storeId: $storeId) @skip(if: $skipPaintDetails) {\n      brandLogo\n      colorType\n      rgb {\n        red\n        green\n        blue\n        __typename\n      }\n      colorDisplayName\n      __typename\n    }\n    specificationGroup @skip(if: $skipSpecificationGroup) {\n      specifications {\n        specName\n        specValue\n        __typename\n      }\n      specTitle\n      __typename\n    }\n    seo {\n      seoKeywords\n      seoDescription\n      __typename\n    }\n    keyProductFeatures @skip(if: $skipKPF) {\n      keyProductFeaturesItems {\n        features {\n          name\n          refinementId\n          refinementUrl\n          value\n          __typename\n        }\n        __typename\n      }\n      __typename\n    }\n    bundleFlag\n    sizeAndFitDetail {\n      attributeGroups {\n        attributes {\n          attributeName\n          dimensions\n          __typename\n        }\n        dimensionLabel\n        productType\n        __typename\n      }\n      __typename\n    }\n    bundleSpecificationDetails(storeId: $storeId, zipCode: $zipCode) {\n      parents {\n        parentId\n        __typename\n      }\n      type\n      experienceType\n      __typename\n    }\n    seoDescription\n    __typename\n  }\n}'
 
 
 # ───────────────────────── scrape.do URLs ─────────────────────────
-def build_scrapedo_get_url(target_url: str) -> str:
-    return f"{SCRAPEDO}?token={settings.scrapedo_token}&url={quote(target_url, safe='')}&geoCode=us"
-
-
 def build_scrapedo_url(url: str, store_id: str | None, zip_code: str | None) -> str:
     params = f"token={settings.scrapedo_token}&url={quote(url, safe='')}&geoCode=us"
     cookies = []
@@ -46,24 +48,13 @@ def build_scrapedo_url(url: str, store_id: str | None, zip_code: str | None) -> 
     return f"{SCRAPEDO}?{params}"
 
 
-# ───────────────────────── requests ─────────────────────────
-async def lookup_store(store_id: str, client: httpx.AsyncClient) -> dict | None:
-    """StoreSearchServices se poora store object (raw)."""
-    url = f"{STORESEARCH_URL}?storeid={store_id}&type=json"
-    for attempt in range(1, settings.retries + 1):
-        try:
-            r = await client.get(build_scrapedo_get_url(url))
-            if r.status_code == 200:
-                stores = (r.json() or {}).get("stores") or []
-                return stores[0] if stores else None
-        except Exception:  # noqa: BLE001
-            pass
-        await asyncio.sleep(0.5 * attempt)
-    return None
+def build_scrapedo_post_url() -> str:
+    return (f"{SCRAPEDO}?token={settings.scrapedo_token}"
+            f"&url={quote(GRAPHQL_URL, safe='')}&geoCode=us&customHeaders=true")
 
 
-async def fetch_pdp_html(url: str, store_id: str | None, zip_code: str | None,
-                         client: httpx.AsyncClient) -> dict:
+# ───────────────────────── request 1: PDP HTML ─────────────────────────
+async def fetch_pdp_html(url, store_id, zip_code, client) -> dict:
     last_err = "unknown error"
     for attempt in range(1, settings.retries + 1):
         try:
@@ -79,73 +70,140 @@ async def fetch_pdp_html(url: str, store_id: str | None, zip_code: str | None,
     return {"status": "failed", "error": last_err}
 
 
-# ───────────────────────── HTML me store data ─────────────────────────
+# ───────────────────────── request 2: GraphQL (stock/store/zip) ─────────────────────────
+async def fetch_graphql(item_id, store_id, zip_code, client) -> dict:
+    payload = {
+        "operationName": "productClientOnlyProduct",
+        "variables": {
+            "skipInstallServices": True,
+            "skipFavoriteCount": False,
+            "skipSubscribeAndSave": False,
+            "skipPaintDetails": True,
+            "skipSpecificationGroup": False,
+            "skipKPF": False,
+            "isBrandPricingPolicyCompliant": False,
+            "itemId": item_id,
+            "loyaltyMembershipInput": None,
+            "storeId": store_id,
+            "zipCode": zip_code,
+        },
+        "query": PRODUCT_QUERY,
+    }
+    headers = {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "content-type": "application/json",
+        "origin": "https://www.homedepot.com",
+        "referer": "https://www.homedepot.com/",
+        "user-agent": UA,
+        "x-current-url": f"/p/{item_id}",
+        "x-debug": "false",
+        "x-experience-name": "fusion-gm-pip-desktop",
+        "x-hd-dc": "origin",
+    }
+    last_err = "unknown error"
+    for attempt in range(1, settings.retries + 1):
+        try:
+            r = await client.post(build_scrapedo_post_url(), json=payload, headers=headers)
+            try:
+                body = r.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            prod = (body.get("data") or {}).get("product")
+            if prod and prod.get("fulfillment"):
+                return {"status": "success", "body": body, "product": prod}
+            last_err = f"HTTP {r.status_code}: {r.text[:300]}"
+            if r.status_code in (400, 401):
+                break
+        except Exception as e:  # noqa: BLE001
+            last_err = f"{type(e).__name__}: {e}"
+        await asyncio.sleep(0.5 * attempt)
+    return {"status": "failed", "error": last_err}
+
+
+# ───────────────────────── GraphQL data -> HTML ─────────────────────────
 def _dump_js_safe(obj) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).replace("</", "<\\/")
 
 
-def _store_fields(store: dict, store_id: str) -> tuple[str, str, str]:
-    """StoreSearch response se id / name / zip (field names thode alag ho sakte hain)."""
-    addr = store.get("address") or {}
-    sid = str(store.get("storeId") or store_id)
-    name = store.get("name") or store.get("storeName") or ""
-    szip = str(addr.get("postalCode") or addr.get("zip") or store.get("zipCode") or "")[:5]
-    return sid, name, szip
+def _splice_json(html: str, marker_re: str, mutate) -> str:
+    """'window.X = {json}' dhoondo, mutate(obj) chalao, wapas usi jagah likho."""
+    m = re.search(marker_re, html)
+    if not m:
+        return html
+    try:
+        start = html.find("{", m.end() - 1)
+        obj, n = json.JSONDecoder().raw_decode(html[start:])
+        mutate(obj)
+        return html[:start] + _dump_js_safe(obj) + html[start + n:]
+    except Exception:  # noqa: BLE001
+        return html
 
 
-def apply_store_to_html(html: str, store: dict, store_id: str, zip_code: str | None) -> str:
-    sid, name, szip = _store_fields(store, store_id)
+def _store_from_graphql(prod: dict, store_id: str) -> dict:
+    """Fulfillment me se requested store ki location (name/state/phone)."""
+    for opt in (prod.get("fulfillment") or {}).get("fulfillmentOptions") or []:
+        for svc in opt.get("services") or []:
+            for loc in svc.get("locations") or []:
+                if loc.get("type") == "store" and loc.get("storeName"):
+                    return loc
+    return {"locationId": store_id}
 
-    def sub(seg: str, key: str, val: str) -> str:
-        return re.sub(rf'("{key}"\s*:\s*")[^"]*(")',
-                      lambda m: m.group(1) + val + m.group(2), seg)
 
-    # 1) __EXPERIENCE_CONTEXT__ -> poora "store": {...} object StoreSearch data se replace
+def apply_graphql_to_html(html: str, item_id: str, prod: dict, body: dict,
+                          store_id: str, zip_code: str | None) -> str:
+    loc = _store_from_graphql(prod, store_id)
+    store_name = loc.get("storeName") or ""
+    ck = lambda d: json.dumps(d, separators=(",", ":"))  # noqa: E731
+
+    # 1) __APOLLO_STATE__ -> store-wise pricing / badges / fulfillment / availability
+    def mut_apollo(ap: dict):
+        node = ap.get(f"base-catalog-{item_id}")
+        if node is None:
+            return
+        for k in [k for k in node if k.startswith(("pricing(", "badges(", "fulfillment("))]:
+            del node[k]
+        if prod.get("pricing") is not None:
+            node["pricing(" + ck({"isBrandPricingPolicyCompliant": False, "storeId": store_id}) + ")"] = prod["pricing"]
+        if prod.get("badges") is not None:
+            node["badges(" + ck({"storeId": store_id}) + ")"] = prod["badges"]
+        ful_args = {"storeId": store_id}
+        if zip_code:
+            ful_args["zipCode"] = zip_code
+        node["fulfillment(" + ck(ful_args) + ")"] = prod["fulfillment"]
+        if prod.get("availabilityType"):
+            node["availabilityType"] = prod["availabilityType"]
+
+    html = _splice_json(html, r"__APOLLO_STATE__\s*=\s*", mut_apollo)
+
+    # 2) __APOLLO_OPERATIONS -> storeId
+    def mut_ops(ops: dict):
+        for op in ops.get("operations", []):
+            v = op.get("variables")
+            if isinstance(v, dict) and "storeId" in v:
+                v["storeId"] = store_id
+
+    html = _splice_json(html, r"__APOLLO_OPERATIONS\s*=\s*", mut_ops)
+
+    # 3) __EXPERIENCE_CONTEXT__ -> store / zip
     i = html.find("window.__EXPERIENCE_CONTEXT__")
     if i != -1:
         j = html.find("</script>", i)
         seg = html[i:j]
-        new_store = {
-            "storeHours": store.get("storeHours") or {},
-            "storeId": sid,
-            "storeName": name,
-            "storeZip": szip,
-        }
-        m_store = re.search(r'"store"\s*:\s*\{', seg)
-        replaced = False
-        if m_store:
-            try:
-                s = m_store.end() - 1
-                _, n = json.JSONDecoder().raw_decode(seg[s:])
-                seg = seg[:s] + _dump_js_safe(new_store) + seg[s + n:]
-                replaced = True
-            except Exception:  # noqa: BLE001
-                pass
-        if not replaced:  # fallback: sirf fields replace
-            seg = sub(seg, "storeId", sid)
-            seg = sub(seg, "storeName", name)
-            seg = sub(seg, "storeZip", szip)
-        seg = sub(seg, "localStoreZip", szip)
+
+        def sub(s, key, val):
+            return re.sub(rf'("{key}"\s*:\s*")[^"]*(")', lambda m: m.group(1) + val + m.group(2), s)
+
+        seg = sub(seg, "storeId", store_id)
+        seg = sub(seg, "storeName", store_name)
         if zip_code:
+            seg = sub(seg, "storeZip", zip_code)
+            seg = sub(seg, "localStoreZip", zip_code)
             seg = sub(seg, "deliveryZip", zip_code)
         html = html[:i] + seg + html[j:]
 
-    # 2) __APOLLO_OPERATIONS -> storeId
-    m = re.search(r"__APOLLO_OPERATIONS\s*=\s*", html)
-    if m:
-        try:
-            start = html.find("{", m.end() - 1)
-            ops, n = json.JSONDecoder().raw_decode(html[start:])
-            for op in ops.get("operations", []):
-                v = op.get("variables")
-                if isinstance(v, dict) and "storeId" in v:
-                    v["storeId"] = sid
-            html = html[:start] + _dump_js_safe(ops) + html[start + n:]
-        except Exception:  # noqa: BLE001
-            pass
-
-    # 3) poora StoreSearch response ek script tag me
-    block = f'<script id="store-search-data" type="application/json">{_dump_js_safe(store)}</script>'
+    # 4) poora GraphQL response ek script tag me
+    block = f'<script id="graphql-product-data" type="application/json">{_dump_js_safe(body)}</script>'
     k = html.lower().rfind("</body>")
     return (html[:k] + block + html[k:]) if k != -1 else (html + block)
 
@@ -165,20 +223,25 @@ async def scrape_pdp(url: str, store_id: str | None = None, zip_code: str | None
                 return {"url": url, "status": "failed", "error": pdp["error"]}
             return {"url": url, "status": "success 200", "data": pdp["html"], "stock_status": "n/a"}
 
-        # dono requests parallel
-        store, pdp = await asyncio.gather(
-            lookup_store(store_id, client),
+        m = ITEM_ID_RE.search(url)
+        if not m:
+            return {"url": url, "status": "failed", "error": "item id not found in url"}
+        item_id = m.group(1)
+
+        # 2 requests, parallel
+        pdp, gql = await asyncio.gather(
             fetch_pdp_html(url, store_id, zip_code, client),
+            fetch_graphql(item_id, store_id, zip_code, client),
         )
 
-        if store is None:
-            return {"url": url, "status": "failed",
-                    "error": f"store_id {store_id} not found via StoreSearchServices"}
         if pdp["status"] != "success":
             return {"url": url, "status": "failed", "error": pdp["error"]}
+        if gql["status"] != "success":
+            return {"url": url, "status": "failed",
+                    "error": f"graphql failed: {gql['error']}", "stock_status": "graphql failed"}
 
-        html = apply_store_to_html(pdp["html"], store, store_id, zip_code)
-        return {"url": url, "status": "success 200", "data": html, "stock_status": "store-search"}
+        html = apply_graphql_to_html(pdp["html"], item_id, gql["product"], gql["body"], store_id, zip_code)
+        return {"url": url, "status": "success 200", "data": html, "stock_status": "graphql injected"}
     finally:
         if own_client:
             await client.aclose()
