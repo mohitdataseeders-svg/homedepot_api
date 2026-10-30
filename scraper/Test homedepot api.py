@@ -2,7 +2,7 @@ import requests
 
 product_url = "https://www.homedepot.com/p/Tzumi-SoundPlay-Open-Ear-Earbuds-30744HD/339509576"
 product_id = "339509576"
-store_id = "115"
+store_id = "154"
 zip_code = "30360"
 
 url = f"https://homedepot-api.onrender.com/v1/homedepot/pdp/{product_id}?store_id={store_id}&zip_code={zip_code}"
