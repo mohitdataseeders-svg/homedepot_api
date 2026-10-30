@@ -1,6 +1,6 @@
 """HomeDepot PDP scraper.
 
-GraphQL fail (206) ho to 4 tarike try hote hain: full query, lite query, phir dono super proxy ke saath.
+GraphQL 206 de to naye proxy IP se retry (max 3 round, har round me full + lite parallel).
 
 Har request pe sirf 2 calls (dono parallel, scrape.do se):
   1) PDP HTML                      -> www.homedepot.com/p/<id>
@@ -20,7 +20,6 @@ import asyncio
 import json
 import re
 import sys
-import uuid
 from urllib.parse import quote
 
 import httpx
@@ -74,32 +73,23 @@ async def fetch_pdp_html(url, store_id, zip_code, client) -> dict:
 STOCK_QUERY_LITE = 'query productClientOnlyProduct($itemId: String!, $loyaltyMembershipInput: LoyaltyMembershipInput, $dataSource: String, $storeId: String, $isBrandPricingPolicyCompliant: Boolean, $zipCode: String, $quantity: Int) {\n  product(itemId: $itemId, loyaltyMembershipInput: $loyaltyMembershipInput, dataSource: $dataSource) {\n    itemId\n    availabilityType {\n      type\n      discontinued\n      status\n      buyable\n      __typename\n    }\n    pricing(\n      storeId: $storeId\n      isBrandPricingPolicyCompliant: $isBrandPricingPolicyCompliant\n    ) {\n      value\n      unitOfMeasure\n      alternatePriceDisplay\n      message\n      original\n      mapAboveOriginalPrice\n      promotion {\n        dollarOff\n        type\n        description {\n          shortDesc\n          longDesc\n          __typename\n        }\n        percentageOff\n        promotionTag\n        savingsCenter\n        savingsCenterPromos\n        specialBuySavings\n        specialBuyDollarOff\n        specialBuyPercentageOff\n        dates {\n          end\n          start\n          __typename\n        }\n        experienceTag\n        subExperienceTag\n        __typename\n      }\n      alternate {\n        bulk {\n          pricePerUnit\n          thresholdQuantity\n          value\n          __typename\n        }\n        unit {\n          caseUnitOfMeasure\n          unitsOriginalPrice\n          unitsPerCase\n          value\n          __typename\n        }\n        __typename\n      }\n      mapDetail {\n        percentageOff\n        dollarOff\n        effectiveMap\n        mapPolicy\n        mapOriginalPriceViolation\n        mapSpecialPriceViolation\n        __typename\n      }\n      preferredPriceFlag\n      specialBuy\n      clearance {\n        value\n        dollarOff\n        percentageOff\n        unitsClearancePrice\n        __typename\n      }\n      conditionalPromotions {\n        experienceTag\n        promotionId\n        skuItemGroup\n        promotionTags\n        eligibilityCriteria {\n          itemGroup\n          minThresholdVal\n          thresholdType\n          minPurchaseAmount\n          minPurchaseQuantity\n          relatedSkusCount\n          omsSkus\n          __typename\n        }\n        reward {\n          tiers {\n            minThresholdVal\n            thresholdType\n            rewardVal\n            rewardType\n            rewardLevel\n            maxAllowedRewardAmount\n            minPurchaseAmount\n            minPurchaseQuantity\n            rewardPercent\n            rewardAmountPerOrder\n            rewardAmountPerItem\n            rewardFixedPrice\n            maxPurchaseQuantity\n            __typename\n          }\n          __typename\n        }\n        dates {\n          start\n          end\n          __typename\n        }\n        description {\n          shortDesc\n          longDesc\n          __typename\n        }\n        subExperienceTag\n        nvalues\n        brandRefinementId\n        __typename\n      }\n      __typename\n    }\n    badges(storeId: $storeId) {\n      name\n      label\n      endDate\n      color\n      creativeImageUrl\n      message\n      timerDuration\n      timer {\n        timeBombThreshold\n        daysLeftThreshold\n        dateDisplayThreshold\n        message\n        __typename\n      }\n      __typename\n    }\n    fulfillment(storeId: $storeId, zipCode: $zipCode, quantity: $quantity) {\n      fulfillmentOptions {\n        services {\n          type\n          locations {\n            isAnchor\n            inventory {\n              quantity\n              isOutOfStock\n              isInStock\n              isLimitedQuantity\n              isUnavailable\n              maxAllowedBopisQty\n              minAllowedBopisQty\n              __typename\n            }\n            curbsidePickupFlag\n            isBuyInStoreCheckNearBy\n            distance\n            locationId\n            state\n            storeName\n            storePhone\n            type\n            storeTimeZone\n            __typename\n          }\n          deliveryTimeline\n          deliveryDates {\n            startDate\n            endDate\n            __typename\n          }\n          deliveryCharge\n          dynamicEta {\n            hours\n            minutes\n            __typename\n          }\n          hasFreeShipping\n          freeDeliveryThreshold\n          totalCharge\n          deliveryMessage\n          earliestDeliveryDate\n          shipFromFastestLocation\n          optimalFulfillment\n          ffaFallbackMode\n          hasSameDayCarDelivery\n          shipFromFastestLocationType\n          sameDayDeliveryCharge\n          __typename\n        }\n        type\n        fulfillable\n        priorityDeliveryOptions {\n          date\n          timeline\n          totalCharge\n          type\n          __typename\n        }\n        programInclusions {\n          description\n          threshold\n          __typename\n        }\n        __typename\n      }\n      anchorStoreStatus\n      anchorStoreStatusType\n      backordered\n      backorderedShipDate\n      bossExcludedShipStates\n      excludedShipStates\n      seasonStatusEligible\n      onlineStoreStatus\n      onlineStoreStatusType\n      sthExcludedShipState\n      fulfillmentBundleMessage\n      bundleComponents {\n        id\n        quantity\n        fulfillmentOptions {\n          type\n          availableFulfillmentTypes\n          __typename\n        }\n        __typename\n      }\n      fallbackMode\n      bossExcludedShipState\n      apoFpoEligible\n      inStoreAssemblyEligible\n      bodfsAssemblyEligible\n      __typename\n    }\n    __typename\n  }\n}'
 
 
-def build_scrapedo_post_url(super_proxy: bool = False) -> str:
-    u = (f"{SCRAPEDO}?token={settings.scrapedo_token}"
-         f"&url={quote(GRAPHQL_URL, safe='')}&geoCode=us&customHeaders=true")
-    return u + "&super=true" if super_proxy else u
+def build_scrapedo_post_url() -> str:
+    return (f"{SCRAPEDO}?token={settings.scrapedo_token}"
+            f"&url={quote(GRAPHQL_URL, safe='')}&geoCode=us&customHeaders=true")
 
 
 def _graphql_headers(item_id: str) -> dict:
+    # Wahi minimal headers jo local pe pehle chal chuke hain ("injected" aaya tha)
     return {
-        "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
         "content-type": "application/json",
+        "accept": "*/*",
         "origin": "https://www.homedepot.com",
         "referer": "https://www.homedepot.com/",
-        "user-agent": UA,
-        "sec-ch-ua": '"Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-site",
-        "x-api-cookies": json.dumps({"x-user-id": str(uuid.uuid4())}),
-        "x-current-url": f"/p/{item_id}",
-        "x-debug": "false",
         "x-experience-name": "fusion-gm-pip-desktop",
+        "x-current-url": f"/p/{item_id}",
         "x-hd-dc": "origin",
-        "x-thd-customer-token": "",
+        "x-debug": "false",
+        "user-agent": UA,
     }
 
 
@@ -120,34 +110,44 @@ def _graphql_payload(query: str, item_id: str, store_id: str, zip_code: str | No
     return {"operationName": "productClientOnlyProduct", "variables": variables, "query": query}
 
 
-# HTTP 206 "Generic Errors API" aaye to agla tarika try hota hai:
-#   full query -> lite query -> full + super proxy -> lite + super proxy
-# agar header me "(lite)" aaya:
-GRAPHQL_ATTEMPTS = [
-    ("lite", False),
-    ("lite", True),   # backup, sirf tab chalega jab pehla fail ho
-]
+# HTTP 206 "Generic Errors API" proxy IP pe depend karta hai: kisi IP pe chalta hai,
+# kisi pe nahi. scrape.do har request pe naya IP deta hai, isliye retry karte hain.
+# Har round me 2 requests ek saath (full + lite) -> jo pehle sahi aaye wo use.
+GRAPHQL_ROUNDS = 3
+
+
+async def _graphql_once(name, item_id, store_id, zip_code, client) -> dict:
+    query = PRODUCT_QUERY if name == "full" else STOCK_QUERY_LITE
+    try:
+        r = await client.post(build_scrapedo_post_url(), json=_graphql_payload(query, item_id, store_id, zip_code),
+                              headers=_graphql_headers(item_id))
+        try:
+            body = r.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        prod = (body.get("data") or {}).get("product")
+        if prod and prod.get("fulfillment"):
+            return {"status": "success", "body": body, "product": prod, "via": name}
+        return {"status": "failed", "error": f"{name}: HTTP {r.status_code} {r.text[:80]}"}
+    except Exception as e:  # noqa: BLE001
+        return {"status": "failed", "error": f"{name}: {type(e).__name__}: {e}"}
 
 
 async def fetch_graphql(item_id, store_id, zip_code, client) -> dict:
     errors = []
-    for name, super_proxy in GRAPHQL_ATTEMPTS:
-        query = PRODUCT_QUERY if name == "full" else STOCK_QUERY_LITE
-        payload = _graphql_payload(query, item_id, store_id, zip_code)
-        label = name + ("+super" if super_proxy else "")
+    for rnd in range(1, GRAPHQL_ROUNDS + 1):
+        tasks = [asyncio.create_task(_graphql_once(n, item_id, store_id, zip_code, client))
+                 for n in ("full", "lite")]
         try:
-            r = await client.post(build_scrapedo_post_url(super_proxy), json=payload,
-                                  headers=_graphql_headers(item_id))
-            try:
-                body = r.json()
-            except Exception:  # noqa: BLE001
-                body = {}
-            prod = (body.get("data") or {}).get("product")
-            if prod and prod.get("fulfillment"):
-                return {"status": "success", "body": body, "product": prod, "via": label}
-            errors.append(f"{label}: HTTP {r.status_code} {r.text[:120]}")
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"{label}: {type(e).__name__}: {e}")
+            for fut in asyncio.as_completed(tasks):
+                res = await fut
+                if res["status"] == "success":
+                    res["via"] += f" round {rnd}"
+                    return res
+                errors.append(f"r{rnd} {res['error']}")
+        finally:
+            for t in tasks:
+                t.cancel()
     return {"status": "failed", "error": " | ".join(errors)}
 
 
