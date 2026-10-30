@@ -122,11 +122,10 @@ def _graphql_payload(query: str, item_id: str, store_id: str, zip_code: str | No
 
 # HTTP 206 "Generic Errors API" aaye to agla tarika try hota hai:
 #   full query -> lite query -> full + super proxy -> lite + super proxy
+# agar header me "(lite)" aaya:
 GRAPHQL_ATTEMPTS = [
-    ("full", False),
     ("lite", False),
-    ("full", True),
-    ("lite", True),
+    ("lite", True),   # backup, sirf tab chalega jab pehla fail ho
 ]
 
 
