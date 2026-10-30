@@ -94,11 +94,20 @@ async def lookup_store(store_id: str, client: httpx.AsyncClient) -> dict | None:
     except Exception:
         return None
 
-def build_scrapedo_url(url: str, store_id: str | None, zip_code: str | None) -> str:
+def build_scrapedo_url(url: str, store_id: str | None, zip_code: str | None,
+                       store_label: str = "") -> str:
     params = f"token={settings.scrapedo_token}&url={quote(url, safe='')}&geoCode=us"
     cookies = []
     if store_id:
-        # purana format, ye kaam kar chuka hai (Caguas 6403 aaya tha)
+        loc = {
+            "WORKFLOW": "LOCALIZED_BY_STORE",
+            "THD_LOCSTORE": f"{store_id}+{store_label}+",
+            "THD_INTERNAL": "0",
+            "THD_FORCE_LOC": "0",
+        }
+        if zip_code:
+            loc["THD_STRFINDERZIP"] = zip_code
+        cookies.append("THD_LOCALIZER=" + quote(json.dumps(loc, separators=(",", ":")), safe=""))
         cookies.append(f"THD_PERSIST=C4%3D{store_id}%2B%2B%3BC4_EXP%3D9999999999")
     if zip_code:
         cookies.append(f"DELIVERY_ZIP={zip_code}")
@@ -369,44 +378,6 @@ def parse_pdp(html: str, url: str) -> dict:
         raise ValueError("Parsing failed: page has no product data (blocked or layout changed)")
     return data
     # return html
-
-# TODO : For Json
-
-# async def scrape_pdp(
-#     url: str,
-#     store_id: str | None = None,
-#     zip_code: str | None = None,
-#     client: httpx.AsyncClient | None = None,
-# ) -> dict:
-#     own_client = client is None
-#     client = client or httpx.AsyncClient(timeout=settings.request_timeout)
-#     last_err = "unknown error"
-#     try:
-#         for attempt in range(1, settings.retries + 1):
-#             try:
-#                 r = await client.get(build_scrapedo_url(url, store_id, zip_code))
-#                 if r.status_code == 200:
-#                     # parsing alag thread me, taaki event loop block na ho
-#                     data = await asyncio.to_thread(parse_pdp, r.text, url)
-#                     return {"url": url, "status": "success 200", "data": data}
-#                 last_err = f"HTTP {r.status_code}: {r.text[:200]}"
-#                 if r.status_code in (400, 401, 404):
-#                     break  # retry se koi fayda nahi
-#             except Exception as e:  # noqa: BLE001
-#                 last_err = f"{type(e).__name__}: {e}"
-#             await asyncio.sleep(0.5 * attempt)
-#         return {"url": url, "status": "failed", "error": last_err}
-#     finally:
-#         if own_client:
-#             await client.aclose()
-
-# ═════════════════════════════════════════════════════════════════════
-#  2nd REQUEST: store-wise stock / price (GraphQL)  +  HTML replace
-# ═════════════════════════════════════════════════════════════════════
-# PDP HTML me stock hota hi nahi (client-side fetch hota hai) aur store/zip
-# ka data random default store (jaise 8119 / The Dalles) ka aata hai.
-# Isliye store_id ke saath ye GraphQL request alag se maarte hain aur uska
-# data HTML me jaha jaha store/stock/price ka data hai wahan daal dete hain.
 
 GRAPHQL_URL = (
     "https://apionline.homedepot.com/federation-gateway/graphql"
@@ -929,67 +900,55 @@ def inject_store_stock(
     return html, warnings
 
 
-
-# TODO : For HTML
-
-async def _fetch_html(
-    url: str,
-    store_id: str | None,
-    zip_code: str | None,
-    client: httpx.AsyncClient,
-) -> dict:
-    """1st request: raw PDP HTML (scrape.do). Never raises."""
+async def _fetch_pdp_html(url, store_id, zip_code, client) -> dict:
     last_err = "unknown error"
     for attempt in range(1, settings.retries + 1):
         try:
             r = await client.get(build_scrapedo_url(url, store_id, zip_code))
             if r.status_code == 200:
-                # raw HTML as-is, no parsing
-                return {"url": url, "status": "success 200", "data": r.text}
+                return {"status": "success", "html": r.text}
             last_err = f"HTTP {r.status_code}: {r.text[:200]}"
             if r.status_code in (400, 401, 404):
-                break  # retry se koi fayda nahi
+                break
         except Exception as e:  # noqa: BLE001
             last_err = f"{type(e).__name__}: {e}"
         await asyncio.sleep(0.5 * attempt)
-    return {"url": url, "status": "failed", "error": last_err}
+    return {"status": "failed", "error": last_err}
 
 
-async def scrape_pdp(
-    url: str,
-    store_id: str | None = None,
-    zip_code: str | None = None,
-    client: httpx.AsyncClient | None = None,
-) -> dict:
+async def scrape_pdp(url, store_id=None, zip_code=None, client=None) -> dict:
     own_client = client is None
     client = client or httpx.AsyncClient(timeout=settings.request_timeout)
-    last_err = "unknown error"
     try:
-        store_info = None
-        if store_id:
-            store_info = await lookup_store(store_id, client)
-            if store_info is None:
-                return {
-                    "url": url,
-                    "status": "failed",
-                    "error": f"store_id {store_id} not found via StoreSearchServices",
-                }
+        if not store_id:
+            pdp = await _fetch_pdp_html(url, None, zip_code, client)
+            if pdp["status"] != "success":
+                return {"url": url, "status": "failed", "error": pdp["error"]}
+            return {"url": url, "status": "success 200", "data": pdp["html"], "stock_status": "n/a"}
 
-        for attempt in range(1, settings.retries + 1):
-            try:
-                r = await client.get(build_scrapedo_url(url, store_id, zip_code))
-                if r.status_code == 200:
-                    html = r.text
-                    if store_info:
-                        html = inject_store_search_block(html, store_info)
-                    return {"url": url, "status": "success 200", "data": html}
-                last_err = f"HTTP {r.status_code}: {r.text[:200]}"
-                if r.status_code in (400, 401, 404):
-                    break
-            except Exception as e:  # noqa: BLE001
-                last_err = f"{type(e).__name__}: {e}"
-            await asyncio.sleep(0.5 * attempt)
-        return {"url": url, "status": "failed", "error": last_err}
+        # teeno calls ek saath -> total time = sabse slow wali call
+        store_info, stock, pdp = await asyncio.gather(
+            lookup_store(store_id, client),
+            fetch_stock(url, store_id, zip_code, client),
+            _fetch_pdp_html(url, store_id, zip_code, client),
+        )
+
+        if store_info is None:
+            return {"url": url, "status": "failed",
+                    "error": f"store_id {store_id} not found via StoreSearchServices"}
+        if pdp["status"] != "success":
+            return {"url": url, "status": "failed", "error": pdp["error"]}
+
+        html, warnings = pdp["html"], []
+        if stock["status"] == "success":
+            html, warnings = inject_store_stock(html, url, stock["product"], store_id, zip_code)
+            stock_status = "injected" + (" (with warnings)" if warnings else "")
+        else:
+            stock_status = f"stock failed: {stock['error'][:100]}"
+
+        html = inject_store_search_block(html, store_info)
+        return {"url": url, "status": "success 200", "data": html,
+                "stock_status": stock_status, "inject_warnings": warnings}
     finally:
         if own_client:
             await client.aclose()
