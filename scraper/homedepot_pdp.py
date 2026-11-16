@@ -507,6 +507,13 @@ def apply_store_product(data: dict, prod: dict) -> dict:
         data["Stock"] = "InStock" if avail.get("buyable") else "OutOfStock"
 
     # Naye store-level fields
+    ful = prod.get("fulfillment") or {}
+    if not ful.get("fulfillmentOptions") and not pick:
+        data["Store Availability"] = "NotSoldInStore"     # online-only item, store me stock hota hi nahi
+    elif inv:
+        data["Store Availability"] = "InStock" if inv.get("isInStock") else "OutOfStock"
+    else:
+        data["Store Availability"] = "Unavailable"
     data["Store Price"] = pr.get("value")
     data["Clearance Price"] = cl.get("value")
     data["Clearance Dollar Off"] = cl.get("dollarOff")
@@ -631,6 +638,15 @@ def fill_html(html: str, item_id: str, prod: dict, data: dict, store: dict,
         if prod.get("availabilityType"):
             node["availabilityType"] = prod["availabilityType"]
 
+        # Recommendation section me isi item ka card (fbr-<item>) bhi requested store ka price dikhaye
+        fbr = ap.get(f"fbr-{item_id}")
+        if isinstance(fbr, dict) and prod.get("pricing") is not None:
+            for k in [k for k in fbr if k.startswith(("pricing(", "badges("))]:
+                del fbr[k]
+            fbr["pricing(" + ck({"isBrandPricingPolicyCompliant": False, "storeId": store_id}) + ")"] = prod["pricing"]
+            if prod.get("badges") is not None:
+                fbr["badges(" + ck({"storeId": store_id}) + ")"] = prod["badges"]
+
     html = _splice_json(html, r"__APOLLO_STATE__\s*=\s*", mut_apollo)
 
     # 2) __APOLLO_OPERATIONS -> storeId
@@ -659,7 +675,9 @@ def fill_html(html: str, item_id: str, prod: dict, data: dict, store: dict,
                 pass
 
         def sub(text, key, val):
-            return re.sub(rf'("{key}"\s*:\s*")[^"]*(")', lambda mm: mm.group(1) + val + mm.group(2), text)
+            # "key": "..."  ya  "key": undefined/null  -> "key": "val"
+            return re.sub(rf'("{key}"\s*:\s*)(?:"[^"]*"|undefined|null)',
+                          lambda mm: mm.group(1) + json.dumps(val), text)
 
         if data.get("Store Zip"):
             seg = sub(seg, "localStoreZip", data["Store Zip"])
