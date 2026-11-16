@@ -1,18 +1,21 @@
-"""HomeDepot PDP scraper -> HTML (master JSON format ke saath).
+"""HomeDepot PDP API -> HTML (master JSON + store-wise price/stock).
 
 Har request pe 2 calls, dono parallel (scrape.do se):
-  1) PDP page (scrape.do HomeDepot plugin /pdp)  -> product data: name, images, price, specs ...
-  2) StoreSearchServices (storeid)          -> store data: storeId, storeName, storeZip, hours
+  1) PDP HTML       -> normal scrape.do request (page + product details)
+  2) Store data     -> scrape.do HomeDepot plugin  /plugin/homedepot/pdp
+                       (store ka price, clearance, badges, on-hand stock, pickup, delivery)
+  (+ StoreSearchServices: store ka naam / zip / hours. Har store ke liye sirf pehli baar,
+     uske baad memory cache se.)
 
-Phir:
-  - PDP HTML ko parse_pdp() se master JSON format me nikalte hain
-  - Store ID / Store Name / Store Zip us JSON me request-2 ke data se bharte hain
-  - HTML ke __EXPERIENCE_CONTEXT__ me bhi store / zip replace karte hain
-  - Poora JSON </body> se pehle <script id="product-data" type="application/json"> me daalte hain
-  - Final HTML return
+Plugin ka data HTML me:
+  - __APOLLO_STATE__        : pricing / badges / fulfillment / availabilityType -> requested store ke
+  - __APOLLO_OPERATIONS     : storeId -> requested store
+  - __EXPERIENCE_CONTEXT__  : store object (id, name, zip, hours) + localStoreZip / deliveryZip
+  - <script id="store-product-data">  : plugin ka poora JSON
+  - <script id="product-data">        : master JSON (store price / stock ke saath)
 
 Test:
-    python -m scraper.homedepot_pdp https://www.homedepot.com/p/DEWALT-Atomic-20V-Drill/322138372 6175 10010
+    python -m scraper.homedepot_pdp https://www.homedepot.com/p/322138372 6175 10010
 """
 import asyncio
 import hashlib
@@ -28,23 +31,24 @@ from parsel import Selector
 from config import settings
 
 SCRAPEDO = "https://api.scrape.do/"
-SCRAPEDO_PLUGIN = "https://api.scrape.do/plugin/homedepot/pdp"
+PLUGIN_PDP = "https://api.scrape.do/plugin/homedepot/pdp"
 STORESEARCH_URL = "https://www.homedepot.com/StoreSearchServices/v2/storesearch"
+ITEM_ID_RE = re.compile(r"/(\d{6,})(?:[/?#]|$)")
 
-# scrape.do plan ki concurrency limit. Isse zyada calls ek saath gayi to 429 aata hai.
-# Render env me SCRAPEDO_CONCURRENCY set kar sakte ho (plan ke hisaab se), warna 5.
+# scrape.do plan ki concurrency limit (429 se bachne ke liye). Env: SCRAPEDO_CONCURRENCY
 SCRAPEDO_CONCURRENCY = int(getattr(settings, "scrapedo_concurrency", 0) or 5)
 _sd_sem: asyncio.Semaphore | None = None
 
-# Store data roz nahi badalta -> memory me rakh lo, dobara scrape.do call nahi
+# Store ka naam / zip / hours roz nahi badalta -> memory cache
 STORE_CACHE: dict[str, dict] = {}
 
 
 async def sd_get(client: httpx.AsyncClient, url: str) -> httpx.Response:
-    """scrape.do GET: limit ke andar, 429 aaye to ruk ke dobara (max 4 baar)."""
+    """scrape.do GET: concurrency limit ke andar; 429 aaye to ruk ke dobara."""
     global _sd_sem
     if _sd_sem is None:
         _sd_sem = asyncio.Semaphore(SCRAPEDO_CONCURRENCY)
+    r = None
     for wait in (2, 4, 8, 16, None):
         async with _sd_sem:
             r = await client.get(url)
@@ -54,82 +58,73 @@ async def sd_get(client: httpx.AsyncClient, url: str) -> httpx.Response:
     return r
 
 
-# ───────────────────────── request URLs ─────────────────────────
-def build_plugin_url(url: str, store_id: str | None, zip_code: str | None) -> str:
-    params = f"token={settings.scrapedo_token}"
-    if store_id:
-        params += f"&storeid={store_id}"
-    if zip_code:
-        params += f"&zipcode={zip_code}"
-    params += f"&url={quote(url, safe='')}"
-    return f"{SCRAPEDO_PLUGIN}?{params}"
-
-
-def build_scrapedo_get_url(target_url: str) -> str:
-    return f"{SCRAPEDO}?token={settings.scrapedo_token}&url={quote(target_url, safe='')}&geoCode=us"
-
-
-def _find_html(obj):
-    """JSON ke andar kahin bhi '<html' wali string dhoondo."""
-    if isinstance(obj, str):
-        return obj if "<html" in obj[:5000].lower() else None
-    if isinstance(obj, dict):
-        obj = obj.values()
-    if isinstance(obj, (list, tuple)) or hasattr(obj, "__iter__"):
-        for v in obj:
-            found = _find_html(v)
-            if found:
-                return found
-    return None
-
-
-def _extract_html(text: str) -> tuple[str | None, str]:
-    """/pdp plugin kabhi HTML deta hai, kabhi JSON. Dono me se HTML nikalo."""
-    t = text.lstrip()
-    if not t.startswith(("{", "[")):
-        return text, "html"
-    try:
-        obj = json.loads(t)
-    except Exception:  # noqa: BLE001
-        return text, "html"
-    found = _find_html(obj)
-    if found:
-        return found, "json->html"
-    keys = list(obj.keys())[:15] if isinstance(obj, dict) else type(obj).__name__
-    return None, f"keys: {keys}"
-
-
 # ───────────────────────── request 1: PDP HTML ─────────────────────────
+def build_scrapedo_url(url: str, store_id: str | None, zip_code: str | None) -> str:
+    params = f"token={settings.scrapedo_token}&url={quote(url, safe='')}&geoCode=us"
+    cookies = []
+    if store_id:
+        cookies.append(f"THD_PERSIST=C4%3D{store_id}%2B%2B%3BC4_EXP%3D9999999999")
+    if zip_code:
+        cookies.append(f"DELIVERY_ZIP={zip_code}")
+        cookies.append("DELIVERY_ZIP_TYPE=USER")
+    if cookies:
+        params += "&setCookies=" + quote(";".join(cookies), safe="")
+    return f"{SCRAPEDO}?{params}"
+
+
 async def fetch_pdp_html(url, store_id, zip_code, client) -> dict:
     last_err = "unknown error"
     for attempt in range(1, settings.retries + 1):
         try:
-            r = await sd_get(client, build_plugin_url(url, store_id, zip_code))
+            r = await sd_get(client, build_scrapedo_url(url, store_id, zip_code))
             if r.status_code == 200:
-                html, info = _extract_html(r.text)
-                if html is None:
-                    return {"status": "failed", "error": f"plugin ne JSON diya, HTML nahi mila ({info})",
-                            "raw": r.text}
-                return {"status": "success", "html": html}
+                return {"status": "success", "html": r.text}
             last_err = f"HTTP {r.status_code}: {r.text[:200]}"
             if r.status_code in (400, 401, 404):
                 break
         except Exception as e:  # noqa: BLE001
             last_err = f"{type(e).__name__}: {e}"
-        # "localization failed" (502) free hai, plugin ko naya IP lene ka time do
         await asyncio.sleep(2 * attempt)
     return {"status": "failed", "error": last_err}
 
 
-# ───────────────────────── request 2: store data ─────────────────────────
-async def lookup_store(store_id: str, client) -> tuple[dict | None, str]:
-    """StoreSearchServices se store ka poora object (name, address, hours ...).
-    Return: (store, error). store=None + error="not_found" -> store ID HomeDepot pe hai hi nahi.
-    store=None + koi aur error -> request fail hui (block / quota / network)."""
-    if store_id in STORE_CACHE:
-        return STORE_CACHE[store_id], ""
-    url = f"{STORESEARCH_URL}?storeid={store_id}&type=json"
+# ───────────────────────── request 2: store-wise product (plugin) ─────────────────────────
+def build_plugin_pdp_url(item_id: str, store_id: str, zip_code: str) -> str:
+    product_url = f"https://www.homedepot.com/p/-/{item_id}"   # guide: /p/-/<itemId> chalta hai
+    return (f"{PLUGIN_PDP}?token={settings.scrapedo_token}"
+            f"&url={quote(product_url, safe='')}&storeid={store_id}&zipcode={zip_code}")
+
+
+async def fetch_store_product(item_id, store_id, zip_code, client) -> dict:
+    """Plugin /pdp -> HomeDepot ka product object (store price + stock). 400/404 pe retry nahi."""
     last_err = "unknown error"
+    for attempt in range(1, settings.retries + 1):
+        try:
+            r = await sd_get(client, build_plugin_pdp_url(item_id, store_id, zip_code))
+            if r.status_code == 200:
+                prod = r.json()
+                if isinstance(prod, dict) and isinstance(prod.get("data"), dict) and prod["data"].get("product"):
+                    prod = prod["data"]["product"]
+                return {"status": "success", "product": prod}
+            last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+            if r.status_code in (400, 401, 404):
+                return {"status": "failed", "error": last_err, "code": r.status_code}
+        except Exception as e:  # noqa: BLE001
+            last_err = f"{type(e).__name__}: {e}"
+        await asyncio.sleep(2 * attempt)   # 502 "homedepot pdp failed" -> safe to retry, charge nahi
+    return {"status": "failed", "error": last_err, "code": 502}
+
+
+# ───────────────────────── store name / zip / hours ─────────────────────────
+def build_scrapedo_get_url(target_url: str) -> str:
+    return f"{SCRAPEDO}?token={settings.scrapedo_token}&url={quote(target_url, safe='')}&geoCode=us"
+
+
+async def lookup_store(store_id: str, client) -> dict | None:
+    """StoreSearchServices se store object. Fail ho to None (non-fatal)."""
+    if store_id in STORE_CACHE:
+        return STORE_CACHE[store_id]
+    url = f"{STORESEARCH_URL}?storeid={store_id}&type=json"
     for attempt in range(1, settings.retries + 1):
         try:
             r = await sd_get(client, build_scrapedo_get_url(url))
@@ -137,13 +132,12 @@ async def lookup_store(store_id: str, client) -> tuple[dict | None, str]:
                 stores = (r.json() or {}).get("stores") or []
                 if stores:
                     STORE_CACHE[store_id] = stores[0]
-                    return stores[0], ""
-                return None, "not_found"
-            last_err = f"HTTP {r.status_code}: {r.text[:150]}"
-        except Exception as e:  # noqa: BLE001
-            last_err = f"{type(e).__name__}: {e}"
+                    return stores[0]
+                return None
+        except Exception:  # noqa: BLE001
+            pass
         await asyncio.sleep(2 * attempt)
-    return None, last_err
+    return None
 
 
 # ───────────────────────── master JSON format (parse_pdp) ─────────────────────────
@@ -448,30 +442,134 @@ def parse_pdp(html: str, url: str) -> dict:
     # return html
 
 
-# ───────────────────────── store data + JSON -> HTML ─────────────────────────
+# ───────────────────────── plugin data -> master JSON ─────────────────────────
 def _dump_js_safe(obj) -> str:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).replace("</", "<\\/")
 
 
-def _store_fields(store: dict, store_id: str) -> tuple[str, str, str]:
-    addr = store.get("address") or {}
-    # HomeDepot ka 4-digit format rakho: "910" -> "0910", "115" -> "0115"
-    sid = str(store.get("storeId") or store_id).zfill(4)
-    name = store.get("name") or ""
-    szip = str(addr.get("postalCode") or "")[:5]
-    return sid, name, szip
+def _pickup_location(prod: dict) -> dict:
+    for opt in ((prod.get("fulfillment") or {}).get("fulfillmentOptions") or []):
+        if opt.get("type") != "pickup":
+            continue
+        for svc in opt.get("services") or []:
+            if svc.get("type") != "bopis":
+                continue
+            locs = svc.get("locations") or []
+            for loc in locs:
+                if loc.get("isAnchor"):
+                    return loc | {"_fulfillable": opt.get("fulfillable")}
+            if locs:
+                return locs[0] | {"_fulfillable": opt.get("fulfillable")}
+    return {}
 
 
-def fill_html(html: str, data: dict, store: dict, store_id: str, zip_code: str | None) -> str:
-    sid, name, szip = _store_fields(store, store_id)
+def _delivery_service(prod: dict, svc_type: str) -> dict:
+    for opt in ((prod.get("fulfillment") or {}).get("fulfillmentOptions") or []):
+        for svc in opt.get("services") or []:
+            if svc.get("type") == svc_type:
+                return svc
+    return {}
 
-    # 1) __EXPERIENCE_CONTEXT__: poora "store": {...} object + zips
+
+def apply_store_product(data: dict, prod: dict) -> dict:
+    """Plugin ke store-wise values master JSON me (price, clearance, stock, pickup, delivery)."""
+    pr = prod.get("pricing") or {}
+    cl = pr.get("clearance") or {}
+    avail = prod.get("availabilityType") or {}
+    pick = _pickup_location(prod)
+    inv = pick.get("inventory") or {}
+    sth = _delivery_service(prod, "sth")
+    sth_inv = ((sth.get("locations") or [{}])[0].get("inventory") or {})
+    exp = _delivery_service(prod, "express delivery")
+    promo = pr.get("promotion") or {}
+
+    if pr.get("value") is not None:
+        data["Sale Price"] = pr["value"]
+        data["Full Price"] = pr["original"] if pr.get("original") is not None else pr["value"]
+    if promo:
+        data["Promo Type"] = promo.get("type", "")
+        data["Promo Dollar Off"] = promo.get("dollarOff", "")
+        data["Promo Percent Off"] = promo.get("percentageOff", "")
+        dates = promo.get("dates") or {}
+        data["Promo Start"], data["Promo End"] = dates.get("start", ""), dates.get("end", "")
+    if avail:
+        data["Availability Type"] = avail.get("type", "")
+        data["Is Discontinued"] = avail.get("discontinued", "")
+
+    # Stock = store pe on-hand (pickup). Item store me nahi bikta to online buyable se.
+    if inv:
+        data["Stock"] = "InStock" if inv.get("isInStock") else "OutOfStock"
+    elif avail.get("buyable") is not None:
+        data["Stock"] = "InStock" if avail.get("buyable") else "OutOfStock"
+
+    # Naye store-level fields
+    data["Store Price"] = pr.get("value")
+    data["Clearance Price"] = cl.get("value")
+    data["Clearance Dollar Off"] = cl.get("dollarOff")
+    data["Clearance Percent Off"] = cl.get("percentageOff")
+    data["Store Quantity"] = inv.get("quantity")
+    data["Pickup Available"] = pick.get("_fulfillable")
+    data["Ship To Home Quantity"] = sth_inv.get("quantity")
+    data["Ship To Home Date"] = (sth.get("deliveryDates") or {}).get("startDate")
+    data["Express Delivery Date"] = (exp.get("deliveryDates") or {}).get("startDate")
+    data["Express Delivery Charge"] = exp.get("deliveryCharge")
+    data["Badges"] = [b.get("label") or b.get("name") for b in (prod.get("badges") or [])]
+    return data
+
+
+# ───────────────────────── plugin data -> HTML ─────────────────────────
+def _splice_json(html: str, marker_re: str, mutate) -> str:
+    m = re.search(marker_re, html)
+    if not m:
+        return html
+    try:
+        start = html.find("{", m.end() - 1)
+        obj, n = json.JSONDecoder().raw_decode(html[start:])
+        mutate(obj)
+        return html[:start] + _dump_js_safe(obj) + html[start + n:]
+    except Exception:  # noqa: BLE001
+        return html
+
+
+def fill_html(html: str, item_id: str, prod: dict, data: dict, store: dict,
+              store_id: str, zip_code: str) -> str:
+    ck = lambda d: json.dumps(d, separators=(",", ":"))  # noqa: E731
+
+    # 1) __APOLLO_STATE__ -> store-wise pricing / badges / fulfillment / availability
+    def mut_apollo(ap: dict):
+        node = ap.get(f"base-catalog-{item_id}") or next(
+            (v for k, v in ap.items() if k.startswith("base-catalog-")), None)
+        if node is None:
+            return
+        for k in [k for k in node if k.startswith(("pricing(", "badges(", "fulfillment("))]:
+            del node[k]
+        if prod.get("pricing") is not None:
+            node["pricing(" + ck({"isBrandPricingPolicyCompliant": False, "storeId": store_id}) + ")"] = prod["pricing"]
+        if prod.get("badges") is not None:
+            node["badges(" + ck({"storeId": store_id}) + ")"] = prod["badges"]
+        if prod.get("fulfillment") is not None:
+            node["fulfillment(" + ck({"storeId": store_id, "zipCode": zip_code}) + ")"] = prod["fulfillment"]
+        if prod.get("availabilityType"):
+            node["availabilityType"] = prod["availabilityType"]
+
+    html = _splice_json(html, r"__APOLLO_STATE__\s*=\s*", mut_apollo)
+
+    # 2) __APOLLO_OPERATIONS -> storeId
+    def mut_ops(ops: dict):
+        for op in ops.get("operations", []):
+            v = op.get("variables")
+            if isinstance(v, dict) and "storeId" in v:
+                v["storeId"] = store_id
+
+    html = _splice_json(html, r"__APOLLO_OPERATIONS\s*=\s*", mut_ops)
+
+    # 3) __EXPERIENCE_CONTEXT__ -> store object + zips
     i = html.find("window.__EXPERIENCE_CONTEXT__")
     if i != -1:
         j = html.find("</script>", i)
         seg = html[i:j]
-        new_store = {"storeHours": store.get("storeHours") or {},
-                     "storeId": sid, "storeName": name, "storeZip": szip}
+        new_store = {"storeHours": store.get("storeHours") or {}, "storeId": store_id,
+                     "storeName": data.get("Store Name") or "", "storeZip": data.get("Store Zip") or ""}
         m = re.search(r'"store"\s*:\s*\{', seg)
         if m:
             try:
@@ -484,12 +582,19 @@ def fill_html(html: str, data: dict, store: dict, store_id: str, zip_code: str |
         def sub(text, key, val):
             return re.sub(rf'("{key}"\s*:\s*")[^"]*(")', lambda mm: mm.group(1) + val + mm.group(2), text)
 
-        seg = sub(seg, "localStoreZip", szip)
-        if zip_code:
-            seg = sub(seg, "deliveryZip", zip_code)
+        if data.get("Store Zip"):
+            seg = sub(seg, "localStoreZip", data["Store Zip"])
+        seg = sub(seg, "deliveryZip", zip_code)
         html = html[:i] + seg + html[j:]
 
-    # 2) master JSON ek script tag me
+    # 4) plugin ka poora JSON + master JSON
+    blocks = (f'<script id="store-product-data" type="application/json">{_dump_js_safe(prod)}</script>'
+              f'<script id="product-data" type="application/json">{_dump_js_safe(data)}</script>')
+    k = html.lower().rfind("</body>")
+    return (html[:k] + blocks + html[k:]) if k != -1 else (html + blocks)
+
+
+def _append_product_data(html: str, data: dict) -> str:
     block = f'<script id="product-data" type="application/json">{_dump_js_safe(data)}</script>'
     k = html.lower().rfind("</body>")
     return (html[:k] + block + html[k:]) if k != -1 else (html + block)
@@ -501,42 +606,59 @@ async def scrape_pdp(url: str, store_id: str | None = None, zip_code: str | None
     own_client = client is None
     client = client or httpx.AsyncClient(timeout=settings.request_timeout)
     try:
-        if store_id:
-            store_id = str(int(store_id))  # "0115" -> "115"
+        m = ITEM_ID_RE.search(url)
+        item_id = m.group(1) if m else None
 
-        store, store_err = None, ""
-        if store_id:
-            pdp, (store, store_err) = await asyncio.gather(
-                fetch_pdp_html(url, store_id, zip_code, client),
-                lookup_store(store_id, client),
-            )
-        else:
+        # store / zip ke bina: sirf normal PDP
+        if not store_id:
             pdp = await fetch_pdp_html(url, None, zip_code, client)
+            if pdp["status"] != "success":
+                return {"url": url, "status": "failed", "error": pdp["error"]}
+            data = await asyncio.to_thread(parse_pdp, pdp["html"], url)
+            return {"url": url, "status": "success 200", "data": _append_product_data(pdp["html"], data),
+                    "stock_status": "ok (no store)"}
 
+        if not zip_code:
+            return {"url": url, "status": "failed", "error": "zip_code is required with store_id"}
+        if not item_id:
+            return {"url": url, "status": "failed", "error": "item id not found in url"}
+
+        sid_num = str(int(store_id))      # "06175" -> "6175" (requests ke liye)
+        sid_out = sid_num.zfill(4)        # "910" -> "0910" (output ke liye)
+
+        pdp, sp, store = await asyncio.gather(
+            fetch_pdp_html(url, sid_num, zip_code, client),
+            fetch_store_product(item_id, sid_num, zip_code, client),
+            lookup_store(sid_num, client),
+        )
+
+        if sp["status"] != "success":
+            if sp.get("code") == 400:
+                return {"url": url, "status": "failed", "error": f"invalid store_id / zip_code: {sp['error']}"}
+            if sp.get("code") == 404:
+                return {"url": url, "status": "failed", "error": "product not found on HomeDepot"}
+            return {"url": url, "status": "failed", "error": f"store data failed: {sp['error']}"}
         if pdp["status"] != "success":
             return {"url": url, "status": "failed", "error": pdp["error"]}
-        if store_id and store_err == "not_found":
-            return {"url": url, "status": "failed",
-                    "error": f"store_id {store_id} not found on HomeDepot (StoreSearchServices returned no store)"}
 
+        prod = sp["product"]
         html = pdp["html"]
         try:
             data = await asyncio.to_thread(parse_pdp, html, url)
         except Exception as e:  # noqa: BLE001
             return {"url": url, "status": "failed", "error": f"parse failed: {e}"}
 
-        if store:
-            sid, name, szip = _store_fields(store, store_id)
-            data["Store ID"], data["Store Name"], data["Store Zip"] = sid, name, szip
-            html = fill_html(html, data, store, store_id, zip_code)
-            status = f"ok (store {sid} {name} {szip})"
-        else:
-            k = html.lower().rfind("</body>")
-            block = f'<script id="product-data" type="application/json">{_dump_js_safe(data)}</script>'
-            html = (html[:k] + block + html[k:]) if k != -1 else (html + block)
-            # StoreSearch request fail hui (store galat nahi) -> page ka apna store context hi rahega
-            status = f"ok (store lookup failed: {store_err})" if store_id else "ok (no store)"
+        pick = _pickup_location(prod)
+        addr = (store or {}).get("address") or {}
+        data["Store ID"] = sid_out
+        data["Store Name"] = (store or {}).get("name") or pick.get("storeName") or ""
+        data["Store Zip"] = str(addr.get("postalCode") or "")[:5]
+        data["Zip Code"] = zip_code
+        data = apply_store_product(data, prod)
 
+        html = fill_html(html, item_id, prod, data, store or {}, sid_out, zip_code)
+        status = (f"ok (store {sid_out} {data['Store Name']} | price {data.get('Store Price')} "
+                  f"| qty {data.get('Store Quantity')})")
         return {"url": url, "status": "success 200", "data": html, "stock_status": status}
     finally:
         if own_client:
