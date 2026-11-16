@@ -69,6 +69,36 @@ def build_scrapedo_get_url(target_url: str) -> str:
     return f"{SCRAPEDO}?token={settings.scrapedo_token}&url={quote(target_url, safe='')}&geoCode=us"
 
 
+def _find_html(obj):
+    """JSON ke andar kahin bhi '<html' wali string dhoondo."""
+    if isinstance(obj, str):
+        return obj if "<html" in obj[:5000].lower() else None
+    if isinstance(obj, dict):
+        obj = obj.values()
+    if isinstance(obj, (list, tuple)) or hasattr(obj, "__iter__"):
+        for v in obj:
+            found = _find_html(v)
+            if found:
+                return found
+    return None
+
+
+def _extract_html(text: str) -> tuple[str | None, str]:
+    """/pdp plugin kabhi HTML deta hai, kabhi JSON. Dono me se HTML nikalo."""
+    t = text.lstrip()
+    if not t.startswith(("{", "[")):
+        return text, "html"
+    try:
+        obj = json.loads(t)
+    except Exception:  # noqa: BLE001
+        return text, "html"
+    found = _find_html(obj)
+    if found:
+        return found, "json->html"
+    keys = list(obj.keys())[:15] if isinstance(obj, dict) else type(obj).__name__
+    return None, f"keys: {keys}"
+
+
 # ───────────────────────── request 1: PDP HTML ─────────────────────────
 async def fetch_pdp_html(url, store_id, zip_code, client) -> dict:
     last_err = "unknown error"
@@ -76,7 +106,11 @@ async def fetch_pdp_html(url, store_id, zip_code, client) -> dict:
         try:
             r = await sd_get(client, build_plugin_url(url, store_id, zip_code))
             if r.status_code == 200:
-                return {"status": "success", "html": r.text}
+                html, info = _extract_html(r.text)
+                if html is None:
+                    return {"status": "failed", "error": f"plugin ne JSON diya, HTML nahi mila ({info})",
+                            "raw": r.text}
+                return {"status": "success", "html": html}
             last_err = f"HTTP {r.status_code}: {r.text[:200]}"
             if r.status_code in (400, 401, 404):
                 break
