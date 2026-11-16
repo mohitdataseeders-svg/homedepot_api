@@ -88,11 +88,14 @@ async def fetch_pdp_html(url, store_id, zip_code, client) -> dict:
 
 
 # ───────────────────────── request 2: store data ─────────────────────────
-async def lookup_store(store_id: str, client) -> dict | None:
-    """StoreSearchServices se store ka poora object (name, address, hours ...)."""
+async def lookup_store(store_id: str, client) -> tuple[dict | None, str]:
+    """StoreSearchServices se store ka poora object (name, address, hours ...).
+    Return: (store, error). store=None + error="not_found" -> store ID HomeDepot pe hai hi nahi.
+    store=None + koi aur error -> request fail hui (block / quota / network)."""
     if store_id in STORE_CACHE:
-        return STORE_CACHE[store_id]
+        return STORE_CACHE[store_id], ""
     url = f"{STORESEARCH_URL}?storeid={store_id}&type=json"
+    last_err = "unknown error"
     for attempt in range(1, settings.retries + 1):
         try:
             r = await sd_get(client, build_scrapedo_get_url(url))
@@ -100,11 +103,13 @@ async def lookup_store(store_id: str, client) -> dict | None:
                 stores = (r.json() or {}).get("stores") or []
                 if stores:
                     STORE_CACHE[store_id] = stores[0]
-                return stores[0] if stores else None
-        except Exception:  # noqa: BLE001
-            pass
-        await asyncio.sleep(0.5 * attempt)
-    return None
+                    return stores[0], ""
+                return None, "not_found"
+            last_err = f"HTTP {r.status_code}: {r.text[:150]}"
+        except Exception as e:  # noqa: BLE001
+            last_err = f"{type(e).__name__}: {e}"
+        await asyncio.sleep(2 * attempt)
+    return None, last_err
 
 
 # ───────────────────────── master JSON format (parse_pdp) ─────────────────────────
@@ -465,19 +470,20 @@ async def scrape_pdp(url: str, store_id: str | None = None, zip_code: str | None
         if store_id:
             store_id = str(int(store_id))  # "0115" -> "115"
 
+        store, store_err = None, ""
         if store_id:
-            pdp, store = await asyncio.gather(
+            pdp, (store, store_err) = await asyncio.gather(
                 fetch_pdp_html(url, store_id, zip_code, client),
                 lookup_store(store_id, client),
             )
         else:
-            pdp, store = await fetch_pdp_html(url, None, zip_code, client), None
+            pdp = await fetch_pdp_html(url, None, zip_code, client)
 
         if pdp["status"] != "success":
             return {"url": url, "status": "failed", "error": pdp["error"]}
-        if store_id and store is None:
+        if store_id and store_err == "not_found":
             return {"url": url, "status": "failed",
-                    "error": f"store_id {store_id} not found via StoreSearchServices"}
+                    "error": f"store_id {store_id} not found on HomeDepot (StoreSearchServices returned no store)"}
 
         html = pdp["html"]
         try:
@@ -494,7 +500,8 @@ async def scrape_pdp(url: str, store_id: str | None = None, zip_code: str | None
             k = html.lower().rfind("</body>")
             block = f'<script id="product-data" type="application/json">{_dump_js_safe(data)}</script>'
             html = (html[:k] + block + html[k:]) if k != -1 else (html + block)
-            status = "ok (no store)"
+            # StoreSearch request fail hui (store galat nahi) -> page ka apna store context hi rahega
+            status = f"ok (store lookup failed: {store_err})" if store_id else "ok (no store)"
 
         return {"url": url, "status": "success 200", "data": html, "stock_status": status}
     finally:
