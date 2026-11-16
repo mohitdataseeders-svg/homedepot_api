@@ -59,8 +59,11 @@ async def sd_get(client: httpx.AsyncClient, url: str) -> httpx.Response:
 
 
 # ───────────────────────── request 1: PDP HTML ─────────────────────────
-def build_scrapedo_url(url: str, store_id: str | None, zip_code: str | None) -> str:
+def build_scrapedo_url(url: str, store_id: str | None, zip_code: str | None,
+                       super_proxy: bool = False) -> str:
     params = f"token={settings.scrapedo_token}&url={quote(url, safe='')}&geoCode=us"
+    if super_proxy:
+        params += "&super=true"   # residential proxy: ROTATION_FAILED pe scrape.do yahi suggest karta hai
     cookies = []
     if store_id:
         cookies.append(f"THD_PERSIST=C4%3D{store_id}%2B%2B%3BC4_EXP%3D9999999999")
@@ -76,7 +79,8 @@ async def fetch_pdp_html(url, store_id, zip_code, client) -> dict:
     last_err = "unknown error"
     for attempt in range(1, settings.retries + 1):
         try:
-            r = await sd_get(client, build_scrapedo_url(url, store_id, zip_code))
+            # pehli try normal (sasti), baaki super proxy se
+            r = await sd_get(client, build_scrapedo_url(url, store_id, zip_code, super_proxy=attempt > 1))
             if r.status_code == 200:
                 return {"status": "success", "html": r.text}
             last_err = f"HTTP {r.status_code}: {r.text[:200]}"
@@ -517,6 +521,81 @@ def apply_store_product(data: dict, prod: dict) -> dict:
     return data
 
 
+def master_from_plugin(prod: dict, url: str) -> dict:
+    """Page HTML na mile to master JSON seedha plugin ke product object se banao."""
+    ident = prod.get("identifiers") or {}
+    media = prod.get("media") or {}
+    details = prod.get("details") or {}
+    info = prod.get("info") or {}
+    avail = prod.get("availabilityType") or {}
+    brand = ident.get("brandName") or ""
+    name = ident.get("productLabel") or ""
+    if brand and name.lower().startswith(brand.lower()):
+        name = name[len(brand):].lstrip(" -:,|").strip()
+    imgs = []
+    for im in media.get("images") or []:
+        u = (im.get("url") or "").replace("<SIZE>", "1000")
+        if u and u not in imgs:
+            imgs.append(u)
+    crumbs = [b.get("label") for b in ((prod.get("taxonomy") or {}).get("breadCrumbs") or []) if b.get("label")]
+    rr = (prod.get("reviews") or {}).get("ratingsReviews") or {}
+    key_features = {}
+    for item in ((prod.get("keyProductFeatures") or {}).get("keyProductFeaturesItems") or []):
+        for f in item.get("features") or []:
+            key_features[f.get("name")] = f.get("value")
+    specs = {}
+    for g in prod.get("specificationGroup") or []:
+        specs[g.get("specTitle")] = {s.get("specName"): s.get("specValue") for s in (g.get("specifications") or [])}
+    canon = ident.get("canonicalUrl")
+    pr = prod.get("pricing") or {}
+    return {
+        "_id": hashlib.md5(url.encode("utf-8")).hexdigest(),
+        "item_id": prod.get("itemId") or ident.get("itemId"),
+        "Product URL": f"https://www.homedepot.com{canon}" if canon else url,
+        "Product Name": name,
+        "Product ID": prod.get("itemId") or ident.get("itemId"),
+        "Brand": brand,
+        "SKU": ident.get("storeSkuNumber"),
+        "Model": ident.get("modelNumber"),
+        "Datetime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "Image URL": "\n".join(imgs),
+        "Description": details.get("description"),
+        "Category": crumbs[-1] if crumbs else "",
+        "Breadcrumb": " > ".join(crumbs),
+        "Sale Price": pr.get("value"),
+        "Full Price": pr.get("original") if pr.get("original") is not None else pr.get("value"),
+        "Currency": "USD",
+        "Rating": rr.get("averageRating"),
+        "ReviewCount": rr.get("totalReviews"),
+        "Availability": None,
+        "Stock": "InStock" if avail.get("buyable") else "OutOfStock",
+        "Product Type": ident.get("productType", ""),
+        "Model Number": ident.get("modelNumber", ""),
+        "UPC": ident.get("upc", "") or ident.get("upcGtin13", ""),
+        "Availability Type": avail.get("type", ""),
+        "Is Discontinued": avail.get("discontinued", ""),
+        "Is Obsolete": avail.get("obsolete", ""),
+        "Hide Price": info.get("hidePrice", ""),
+        "Quantity Limit": info.get("quantityLimit", ""),
+        "Returnable": info.get("returnable", ""),
+        "Highlights": details.get("highlights") or [],
+        "Key Features": key_features,
+        "Specifications": specs,
+        "seoDescription": (prod.get("seo") or {}).get("seoDescription", ""),
+        "Videos": " | ".join(v.get("url", "") for v in (media.get("video") or []) if v.get("url")),
+        "url": url,
+    }
+
+
+def minimal_html(prod: dict, data: dict) -> str:
+    title = f'{data.get("Brand") or ""} {data.get("Product Name") or ""}'.strip()
+    return ("<!doctype html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+            f"<title>{title.replace('<', '')}</title></head><body>"
+            f'<script id="store-product-data" type="application/json">{_dump_js_safe(prod)}</script>'
+            f'<script id="product-data" type="application/json">{_dump_js_safe(data)}</script>'
+            "</body></html>")
+
+
 # ───────────────────────── plugin data -> HTML ─────────────────────────
 def _splice_json(html: str, marker_re: str, mutate) -> str:
     m = re.search(marker_re, html)
@@ -638,15 +717,17 @@ async def scrape_pdp(url: str, store_id: str | None = None, zip_code: str | None
             if sp.get("code") == 404:
                 return {"url": url, "status": "failed", "error": "product not found on HomeDepot"}
             return {"url": url, "status": "failed", "error": f"store data failed: {sp['error']}"}
-        if pdp["status"] != "success":
-            return {"url": url, "status": "failed", "error": pdp["error"]}
-
         prod = sp["product"]
-        html = pdp["html"]
-        try:
-            data = await asyncio.to_thread(parse_pdp, html, url)
-        except Exception as e:  # noqa: BLE001
-            return {"url": url, "status": "failed", "error": f"parse failed: {e}"}
+        page_ok = pdp["status"] == "success"
+        data = None
+        if page_ok:
+            try:
+                data = await asyncio.to_thread(parse_pdp, pdp["html"], url)
+            except Exception:  # noqa: BLE001
+                page_ok = False
+        if not page_ok:
+            # Page HTML nahi mila (ROTATION_FAILED / block) -> plugin ke data se hi response
+            data = master_from_plugin(prod, url)
 
         pick = _pickup_location(prod)
         addr = (store or {}).get("address") or {}
@@ -656,9 +737,12 @@ async def scrape_pdp(url: str, store_id: str | None = None, zip_code: str | None
         data["Zip Code"] = zip_code
         data = apply_store_product(data, prod)
 
-        html = fill_html(html, item_id, prod, data, store or {}, sid_out, zip_code)
+        if page_ok:
+            html = fill_html(pdp["html"], item_id, prod, data, store or {}, sid_out, zip_code)
+        else:
+            html = minimal_html(prod, data)
         status = (f"ok (store {sid_out} {data['Store Name']} | price {data.get('Store Price')} "
-                  f"| qty {data.get('Store Quantity')})")
+                  f"| qty {data.get('Store Quantity')}" + ("" if page_ok else " | page html failed, plugin only") + ")")
         return {"url": url, "status": "success 200", "data": html, "stock_status": status}
     finally:
         if own_client:
