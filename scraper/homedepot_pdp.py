@@ -1,7 +1,7 @@
 """HomeDepot PDP scraper -> HTML (master JSON format ke saath).
 
 Har request pe 2 calls, dono parallel (scrape.do se):
-  1) PDP page (scrape.do HomeDepot plugin)  -> product data: name, images, price, specs ...
+  1) PDP page (scrape.do HomeDepot plugin /pdp)  -> product data: name, images, price, specs ...
   2) StoreSearchServices (storeid)          -> store data: storeId, storeName, storeZip, hours
 
 Phir:
@@ -12,7 +12,7 @@ Phir:
   - Final HTML return
 
 Test:
-    python -m scraper.homedepot_pdp https://www.homedepot.com/p/342938293 6175 10010
+    python -m scraper.homedepot_pdp https://www.homedepot.com/p/DEWALT-Atomic-20V-Drill/322138372 6175 10010
 """
 import asyncio
 import hashlib
@@ -28,8 +28,30 @@ from parsel import Selector
 from config import settings
 
 SCRAPEDO = "https://api.scrape.do/"
-SCRAPEDO_PLUGIN = "https://api.scrape.do/plugin/homedepot/product"
+SCRAPEDO_PLUGIN = "https://api.scrape.do/plugin/homedepot/pdp"
 STORESEARCH_URL = "https://www.homedepot.com/StoreSearchServices/v2/storesearch"
+
+# scrape.do plan ki concurrency limit. Isse zyada calls ek saath gayi to 429 aata hai.
+# Render env me SCRAPEDO_CONCURRENCY set kar sakte ho (plan ke hisaab se), warna 5.
+SCRAPEDO_CONCURRENCY = int(getattr(settings, "scrapedo_concurrency", 0) or 5)
+_sd_sem: asyncio.Semaphore | None = None
+
+# Store data roz nahi badalta -> memory me rakh lo, dobara scrape.do call nahi
+STORE_CACHE: dict[str, dict] = {}
+
+
+async def sd_get(client: httpx.AsyncClient, url: str) -> httpx.Response:
+    """scrape.do GET: limit ke andar, 429 aaye to ruk ke dobara (max 4 baar)."""
+    global _sd_sem
+    if _sd_sem is None:
+        _sd_sem = asyncio.Semaphore(SCRAPEDO_CONCURRENCY)
+    for wait in (2, 4, 8, 16, None):
+        async with _sd_sem:
+            r = await client.get(url)
+        if r.status_code != 429 or wait is None:
+            return r
+        await asyncio.sleep(wait)
+    return r
 
 
 # ───────────────────────── request URLs ─────────────────────────
@@ -52,7 +74,7 @@ async def fetch_pdp_html(url, store_id, zip_code, client) -> dict:
     last_err = "unknown error"
     for attempt in range(1, settings.retries + 1):
         try:
-            r = await client.get(build_plugin_url(url, store_id, zip_code))
+            r = await sd_get(client, build_plugin_url(url, store_id, zip_code))
             if r.status_code == 200:
                 return {"status": "success", "html": r.text}
             last_err = f"HTTP {r.status_code}: {r.text[:200]}"
@@ -60,19 +82,24 @@ async def fetch_pdp_html(url, store_id, zip_code, client) -> dict:
                 break
         except Exception as e:  # noqa: BLE001
             last_err = f"{type(e).__name__}: {e}"
-        await asyncio.sleep(0.5 * attempt)
+        # "localization failed" (502) free hai, plugin ko naya IP lene ka time do
+        await asyncio.sleep(2 * attempt)
     return {"status": "failed", "error": last_err}
 
 
 # ───────────────────────── request 2: store data ─────────────────────────
 async def lookup_store(store_id: str, client) -> dict | None:
     """StoreSearchServices se store ka poora object (name, address, hours ...)."""
+    if store_id in STORE_CACHE:
+        return STORE_CACHE[store_id]
     url = f"{STORESEARCH_URL}?storeid={store_id}&type=json"
     for attempt in range(1, settings.retries + 1):
         try:
-            r = await client.get(build_scrapedo_get_url(url))
+            r = await sd_get(client, build_scrapedo_get_url(url))
             if r.status_code == 200:
                 stores = (r.json() or {}).get("stores") or []
+                if stores:
+                    STORE_CACHE[store_id] = stores[0]
                 return stores[0] if stores else None
         except Exception:  # noqa: BLE001
             pass
@@ -389,7 +416,8 @@ def _dump_js_safe(obj) -> str:
 
 def _store_fields(store: dict, store_id: str) -> tuple[str, str, str]:
     addr = store.get("address") or {}
-    sid = str(int(store.get("storeId") or store_id))          # "0115" -> "115"
+    # HomeDepot ka 4-digit format rakho: "910" -> "0910", "115" -> "0115"
+    sid = str(store.get("storeId") or store_id).zfill(4)
     name = store.get("name") or ""
     szip = str(addr.get("postalCode") or "")[:5]
     return sid, name, szip
