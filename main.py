@@ -1,11 +1,14 @@
 """FastAPI app: POST list of HomeDepot PDP URLs (stream) + GET single URL / product id -> JSON {success, product_id, store_id, zip_code, html}."""
 import asyncio
+import logging
+import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -16,6 +19,35 @@ from scraper.homedepot_pdp import scrape_pdp
 import re
 
 state: dict = {}
+
+# ───────────── API logs (alag Mongo server) ─────────────
+# Render env me set karo (code me password mat likhna):
+#   LOG_MONGO_URI = mongodb://<user>:<password>@<host>:27017/?authSource=admin
+#   LOG_MONGO_DB  = Homedepot_API_logs
+LOG_MONGO_URI = os.getenv("LOG_MONGO_URI", "")
+LOG_MONGO_DB = os.getenv("LOG_MONGO_DB", "Homedepot_API_logs")
+IST = timezone(timedelta(hours=5, minutes=30))   # roz ki collection IST date se: 2026_11_17
+
+logger = logging.getLogger("homedepot_api")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+def today_collection():
+    """Aaj ki collection: Homedepot_API_logs.2026_11_17"""
+    db = state.get("log_db")
+    if db is None:
+        return None
+    return db[datetime.now(IST).strftime("%Y_%m_%d")]
+
+
+async def save_log(doc: dict):
+    """Log Mongo me daalo. Mongo down ho to bhi API na ruke."""
+    try:
+        col = today_collection()
+        if col is not None:
+            await col.insert_one(doc)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"log save failed: {type(e).__name__}: {e}")
 
 
 @asynccontextmanager
@@ -32,11 +64,68 @@ async def lifespan(app: FastAPI):
         mongo = AsyncIOMotorClient(settings.mongo_uri)
         state["cache"] = mongo[settings.mongo_db]["pdp_cache"]
         await state["cache"].create_index("url")
+
+    state["log_db"] = None
+    if LOG_MONGO_URI:
+        from motor.motor_asyncio import AsyncIOMotorClient
+
+        log_client = AsyncIOMotorClient(LOG_MONGO_URI, serverSelectionTimeoutMS=5000)
+        state["log_db"] = log_client[LOG_MONGO_DB]
+        try:
+            await log_client.admin.command("ping")
+            logger.info(f"log mongo connected: {LOG_MONGO_DB}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"log mongo not reachable: {type(e).__name__}: {e}")
     yield
     await state["client"].aclose()
 
 
 app = FastAPI(title="HomeDepot PDP API", version="1.0", lifespan=lifespan)
+
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Har API hit ka log: console (Render Logs) + Mongo (aaj ki collection)."""
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        stock_status = response.headers.get("X-Stock-Status")
+        error = response.headers.get("X-Error")
+    except Exception as e:  # noqa: BLE001
+        status, stock_status, error, response = 500, None, f"{type(e).__name__}: {e}", None
+    ms = round((time.perf_counter() - start) * 1000)
+
+    q = dict(request.query_params)
+    doc = {
+        "ts": datetime.now(timezone.utc),
+        "ts_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+        "method": request.method,
+        "path": request.url.path,
+        "product_id": request.path_params.get("pro_id") or request.url.path.rstrip("/").split("/")[-1],
+        "url_param": q.get("url"),
+        "store_id": q.get("store_id"),
+        "zip_code": q.get("zip_code"),
+        "query": q,
+        "status": status,
+        "success": 200 <= status < 300,
+        "duration_ms": ms,
+        "ip": (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+              or (request.client.host if request.client else None),
+        "user_agent": request.headers.get("user-agent"),
+        "stock_status": stock_status,
+        "error": error,
+    }
+    logger.info(f'{doc["method"]} {doc["path"]} store={doc["store_id"]} zip={doc["zip_code"]} '
+                f'-> {status} {ms}ms | {error or stock_status or ""}')
+    if request.url.path != "/health":
+        asyncio.create_task(save_log(doc))   # background me, response slow nahi hoga
+
+    if response is None:
+        return HTMLResponse(content="internal error", status_code=500)
+    return response
+
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -109,6 +198,7 @@ def pdp_json_response(res: dict, url: str, store_id: str | None, zip_code: str |
     headers = {"X-Stock-Status": safe_header(res.get("stock_status", "n/a"))}
 
     if not res["status"].startswith("success"):
+        headers["X-Error"] = safe_header(res.get("error") or "failed")
         return JSONResponse(
             status_code=502,
             content={
@@ -135,6 +225,7 @@ def pdp_html_response(res: dict, url: str, store_id: str | None, zip_code: str |
     headers = {"X-Stock-Status": safe_header(res.get("stock_status", "n/a"))}
 
     if not res["status"].startswith("success"):
+        headers["X-Error"] = safe_header(res.get("error") or "failed")   # log me error dikhe
         return HTMLResponse(
             content=res.get("error") or "failed",
             status_code=502,
